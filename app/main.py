@@ -12,7 +12,7 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.api.router import api_router
@@ -317,6 +317,59 @@ def create_app() -> FastAPI:
             return RedirectResponse(url="/", status_code=303)
 
         session_factory = request.app.state.session_factory
+        settings = request.app.state.settings
+        active_tab = (request.query_params.get("tab") or "home").strip().lower()
+        if active_tab not in {"home", "dm", "decision", "discovery", "community"}:
+            active_tab = "home"
+        community_query = (request.query_params.get("community_q") or "").strip()
+        try:
+            community_page = int(request.query_params.get("community_page", "1"))
+        except ValueError:
+            community_page = 1
+        community_page = max(1, community_page)
+        requested_page_size_raw = request.query_params.get("community_page_size")
+        if requested_page_size_raw is not None:
+            try:
+                requested_page_size = int(requested_page_size_raw)
+            except ValueError:
+                requested_page_size = settings.COMMUNITY_PAGE_SIZE
+        else:
+            requested_page_size = settings.COMMUNITY_PAGE_SIZE
+        community_page_size = max(1, min(requested_page_size, settings.COMMUNITY_MAX_PAGE_SIZE))
+        community_offset = (community_page - 1) * community_page_size
+        try:
+            rec_page = int(request.query_params.get("rec_page", "1"))
+        except ValueError:
+            rec_page = 1
+        rec_page = max(1, rec_page)
+        try:
+            rec_page_size_requested = int(
+                request.query_params.get(
+                    "rec_page_size",
+                    str(settings.DASHBOARD_RECOMMENDATION_PAGE_SIZE),
+                )
+            )
+        except ValueError:
+            rec_page_size_requested = settings.DASHBOARD_RECOMMENDATION_PAGE_SIZE
+        rec_page_size = max(1, min(rec_page_size_requested, settings.DASHBOARD_MAX_PANEL_PAGE_SIZE))
+        rec_offset = (rec_page - 1) * rec_page_size
+
+        try:
+            disc_page = int(request.query_params.get("disc_page", "1"))
+        except ValueError:
+            disc_page = 1
+        disc_page = max(1, disc_page)
+        try:
+            disc_page_size_requested = int(
+                request.query_params.get(
+                    "disc_page_size",
+                    str(settings.DASHBOARD_DISCOVERY_PAGE_SIZE),
+                )
+            )
+        except ValueError:
+            disc_page_size_requested = settings.DASHBOARD_DISCOVERY_PAGE_SIZE
+        disc_page_size = max(1, min(disc_page_size_requested, settings.DASHBOARD_MAX_PANEL_PAGE_SIZE))
+        disc_offset = (disc_page - 1) * disc_page_size
         async with session_factory() as session:
             user = (await session.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
             if user is None:
@@ -327,18 +380,35 @@ def create_app() -> FastAPI:
             conversations = await chat_service.list_user_conversations(session, user_id)
 
             recommendations: list[dict[str, Any]] = []
+            recommendations_total = 0
             other_agents: list[dict[str, Any]] = []
+            community_total = 0
             discovery_sessions: list[dict[str, Any]] = []
+            discovery_total = 0
             direct_messages: list[dict[str, Any]] = []
 
             if agent:
+                rec_base_where = (
+                    (Recommendation.from_agent_id == agent.id)
+                    | (Recommendation.to_agent_id == agent.id)
+                )
+                rec_count_result = await session.execute(
+                    select(func.count(Recommendation.id)).where(rec_base_where)
+                )
+                recommendations_total = int(rec_count_result.scalar() or 0)
+                rec_total_pages = max(
+                    1,
+                    (recommendations_total + rec_page_size - 1) // rec_page_size,
+                )
+                rec_page = min(rec_page, rec_total_pages)
+                rec_offset = (rec_page - 1) * rec_page_size
+
                 rec_result = await session.execute(
                     select(Recommendation)
-                    .where(
-                        (Recommendation.from_agent_id == agent.id)
-                        | (Recommendation.to_agent_id == agent.id)
-                    )
+                    .where(rec_base_where)
                     .order_by(Recommendation.created_at.desc())
+                    .offset(rec_offset)
+                    .limit(rec_page_size)
                 )
                 for rec in rec_result.scalars().all():
                     from_agent = (
@@ -362,7 +432,29 @@ def create_app() -> FastAPI:
                         }
                     )
 
-                others_result = await session.execute(select(Agent).where(Agent.id != agent.id))
+                others_query = select(Agent).where(Agent.id != agent.id)
+                if community_query:
+                    others_query = others_query.where(
+                        or_(
+                            Agent.name.ilike(f"%{community_query}%"),
+                            Agent.user_id.in_(
+                                select(User.id).where(User.username.ilike(f"%{community_query}%"))
+                            ),
+                        )
+                    )
+                community_total_result = await session.execute(
+                    select(func.count(Agent.id)).where(others_query.whereclause)
+                )
+                community_total = int(community_total_result.scalar() or 0)
+                community_total_pages = max(
+                    1,
+                    (community_total + community_page_size - 1) // community_page_size,
+                )
+                community_page = min(community_page, community_total_pages)
+                community_offset = (community_page - 1) * community_page_size
+                others_result = await session.execute(
+                    others_query.order_by(Agent.created_at.desc()).offset(community_offset).limit(community_page_size)
+                )
                 other_agents = [
                     {
                         "id": other.id,
@@ -382,6 +474,20 @@ def create_app() -> FastAPI:
                 )
                 agent_conv_ids = [row[0] for row in conv_id_rows.all()]
                 if agent_conv_ids:
+                    discovery_total_result = await session.execute(
+                        select(func.count(Conversation.id))
+                        .where(
+                            (Conversation.id.in_(agent_conv_ids))
+                            & (Conversation.conv_type == "agent_agent")
+                        )
+                    )
+                    discovery_total = int(discovery_total_result.scalar() or 0)
+                    disc_total_pages = max(
+                        1,
+                        (discovery_total + disc_page_size - 1) // disc_page_size,
+                    )
+                    disc_page = min(disc_page, disc_total_pages)
+                    disc_offset = (disc_page - 1) * disc_page_size
                     disc_conv_result = await session.execute(
                         select(Conversation)
                         .where(
@@ -389,7 +495,8 @@ def create_app() -> FastAPI:
                             & (Conversation.conv_type == "agent_agent")
                         )
                         .order_by(Conversation.created_at.desc())
-                        .limit(12)
+                        .offset(disc_offset)
+                        .limit(disc_page_size)
                     )
                     for disc in disc_conv_result.scalars().all():
                         participant_rows = await session.execute(
@@ -520,6 +627,7 @@ def create_app() -> FastAPI:
             name="dashboard.html",
             context={
                 "user": {"id": user.id, "username": user.username},
+                "active_tab": active_tab,
                 "agent": {
                     "id": agent.id,
                     "name": agent.name,
@@ -530,9 +638,25 @@ def create_app() -> FastAPI:
                 else None,
                 "conversations": [conv.model_dump() for conv in conversations],
                 "recommendations": recommendations,
+                "recommendations_total": recommendations_total,
+                "rec_page": rec_page,
+                "rec_page_size": rec_page_size,
+                "rec_has_prev": rec_page > 1,
+                "rec_has_next": rec_offset + len(recommendations) < recommendations_total,
                 "other_agents": other_agents,
+                "community_total": community_total,
+                "community_query": community_query,
+                "community_page": community_page,
+                "community_page_size": community_page_size,
+                "community_has_prev": community_page > 1,
+                "community_has_next": community_offset + len(other_agents) < community_total,
                 "discovery_running": discovery_running,
                 "discovery_sessions": discovery_sessions,
+                "discovery_total": discovery_total,
+                "disc_page": disc_page,
+                "disc_page_size": disc_page_size,
+                "disc_has_prev": disc_page > 1,
+                "disc_has_next": disc_offset + len(discovery_sessions) < discovery_total,
                 "direct_messages": direct_messages,
             },
         )

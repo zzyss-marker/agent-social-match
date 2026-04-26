@@ -26,6 +26,22 @@ class Settings(BaseSettings):
 
     MAX_SIMULATION_BATCH: int = 200
 
+    # Discovery / recommendation controls
+    DISCOVERY_CHAT_MIN_PER_RUN: int = 1
+    DISCOVERY_CHAT_MAX_PER_RUN: int = 3
+    DISCOVERY_CANDIDATE_POOL_LIMIT: int = 80
+    DISCOVERY_REC_COOLDOWN_HOURS: int = 24
+    DISCOVERY_MIN_MATCH_SCORE: int = 68
+    DISCOVERY_MIN_CONFIDENCE: int = 55
+    DISCOVERY_MAX_PENDING_RECOMMENDATIONS: int = 20
+
+    # Dashboard scalability controls
+    COMMUNITY_PAGE_SIZE: int = 24
+    COMMUNITY_MAX_PAGE_SIZE: int = 60
+    DASHBOARD_RECOMMENDATION_PAGE_SIZE: int = 4
+    DASHBOARD_DISCOVERY_PAGE_SIZE: int = 4
+    DASHBOARD_MAX_PANEL_PAGE_SIZE: int = 20
+
     # LLM API for agent interactions (configure via .env)
     LLM_BASE_URL: str = ""
     LLM_API_KEY: str = ""

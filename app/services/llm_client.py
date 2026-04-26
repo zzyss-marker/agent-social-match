@@ -94,9 +94,9 @@ class LLMClient:
         system = {
             "role": "system",
             "content": (
-                "你是用户画像分析助手。请基于对话提取并仅返回 JSON："
+                "你是用户画像提炼助手。请只基于对话中的明确信息提取并仅返回 JSON："
                 '{"traits":["特征1","特征2"],"interests":["兴趣1"],'
-                '"looking_for":"用户在寻找什么","vibe":"整体相处氛围"}。'
+                '"looking_for":"用户在寻找什么","vibe":"相处氛围"}'
             ),
         }
         return await self.chat_json([system] + conversation, temperature=0.1, max_tokens=260)
@@ -105,11 +105,11 @@ class LLMClient:
         system = {
             "role": "system",
             "content": (
-                "你是长期记忆提炼助手。只根据对话中的明确信息提炼可持久化上下文，"
-                "禁止猜测和编造。仅返回 JSON："
+                "你是长期记忆提炼助手。只根据对话中的明确信息提取可持久化上下文，"
+                "禁止猜测或编造。仅返回 JSON："
                 '{"context_memory":["稳定事实1","稳定事实2"],'
                 '"boundaries":["不接受项1"],'
-                '"conversation_style":"用户偏好的沟通方式"}。'
+                '"conversation_style":"用户偏好的沟通方式"}'
             ),
         }
         return await self.chat_json([system] + conversation, temperature=0.0, max_tokens=260)
@@ -128,12 +128,12 @@ class LLMClient:
         system = {
             "role": "system",
             "content": (
-                f"你是 {agent_name}，一个社交 AI 代理。\n"
+                f"你是 {agent_name}，一个社交 AI Agent。\n"
                 f"性格特征：{', '.join(profile) if profile else '暂无'}\n"
                 f"兴趣爱好：{', '.join(interests) if interests else '暂无'}\n"
                 f"正在寻找：{looking_for or '暂无'}\n"
                 f"整体风格：{vibe or '自然友好'}\n"
-                "你正在和另一个代理聊天，请自然、礼貌、简洁回复，每次不超过100字。"
+                "你正在和另一位 Agent 聊天，请自然、礼貌、简洁回复，每次不超过100字。"
             ),
         }
         messages = [system] + conversation_history
@@ -150,16 +150,18 @@ class LLMClient:
         system = {
             "role": "system",
             "content": (
-                "你是匹配评估助手。根据两个代理的资料和对话记录，"
+                "你是社交匹配评估助手。请根据双方资料和对话记录，返回严格、保守的评估。"
+                "若证据不足必须降低分数，不得乐观打分。"
                 "仅返回 JSON："
-                '{"compatible":true/false,"score":0-100,'
-                '"reason":"推荐理由（100字内）","highlights":["亮点1","亮点2"]}。'
+                '{"compatible":true/false,"score":0-100,"confidence":0-100,'
+                '"reason":"推荐理由，100字内","highlights":["亮点1","亮点2"],'
+                '"risks":["风险1","风险2"]}'
             ),
         }
         context = (
             f"{agent_a_name} 资料：{agent_a_profile}\n"
             f"{agent_b_name} 资料：{agent_b_profile}\n"
-            "以下是两位代理的对话记录："
+            "以下是两位 Agent 的对话记录："
         )
         messages = [system, {"role": "user", "content": context}] + conversation_transcript
-        return await self.chat_json(messages, temperature=0.1, max_tokens=320)
+        return await self.chat_json(messages, temperature=0.05, max_tokens=360)

@@ -1,62 +1,42 @@
-{% extends "base.html" %}
+﻿{% extends "base.html" %}
 {% block content %}
 {% set p = agent.personality if agent and agent.personality else {} %}
+{% macro dashboard_url(tab=active_tab, rec_p=rec_page, rec_ps=rec_page_size, disc_p=disc_page, disc_ps=disc_page_size, comm_p=community_page, comm_ps=community_page_size, comm_q=community_query) -%}
+/dashboard?tab={{ tab }}&rec_page={{ rec_p }}&rec_page_size={{ rec_ps }}&disc_page={{ disc_p }}&disc_page_size={{ disc_ps }}&community_q={{ comm_q | urlencode }}&community_page={{ comm_p }}&community_page_size={{ comm_ps }}
+{%- endmacro %}
+{% set tab_label = "主页" %}
+{% if active_tab == "dm" %}{% set tab_label = "私聊" %}{% endif %}
+{% if active_tab == "decision" %}{% set tab_label = "推荐决策" %}{% endif %}
+{% if active_tab == "discovery" %}{% set tab_label = "探索过程" %}{% endif %}
+{% if active_tab == "community" %}{% set tab_label = "社区 Agent" %}{% endif %}
 <div class="console-layout">
   <aside class="console-side card-premium">
     <div class="side-profile">
       <div class="avatar-badge">{{ agent.name[0] if agent else "?" }}</div>
       <div>
-        <strong>{{ agent.name if agent else "未创建Agent" }}</strong>
+        <strong>{{ agent.name if agent else "未创建 Agent" }}</strong>
         <small>
           {% if agent and agent.status == "discovering" %}
           正在后台探索
           {% elif agent %}
           在线待命
           {% else %}
-          无可用代理
+          无可用 Agent
           {% endif %}
         </small>
       </div>
     </div>
 
-    <nav class="side-nav">
-      <a href="/dashboard" class="side-link active">控制台</a>
+    <nav class="side-nav side-nav-tabs">
       {% if agent %}
-      <a href="/chat/{{ agent.id }}" class="side-link">和Agent聊天</a>
+      <a href="/chat/{{ agent.id }}" class="side-link side-link-chat-cta">立即和 Agent 聊天</a>
       {% endif %}
+      <a href="{{ dashboard_url(tab='home') }}" class="side-link{% if active_tab == 'home' %} active{% endif %}">主页</a>
+      <a href="{{ dashboard_url(tab='dm') }}" class="side-link{% if active_tab == 'dm' %} active{% endif %}">私聊</a>
+      <a href="{{ dashboard_url(tab='decision') }}" class="side-link{% if active_tab == 'decision' %} active{% endif %}">推荐决策</a>
+      <a href="{{ dashboard_url(tab='discovery') }}" class="side-link{% if active_tab == 'discovery' %} active{% endif %}">探索过程</a>
+      <a href="{{ dashboard_url(tab='community') }}" class="side-link{% if active_tab == 'community' %} active{% endif %}">社区 Agent</a>
     </nav>
-
-    <section class="side-block">
-      <h4>用户画像记忆</h4>
-      {% if p.get("traits") %}
-      <div class="chip-group">
-        {% for t in p.get("traits", [])[:8] %}
-        <span class="chip">{{ t }}</span>
-        {% endfor %}
-      </div>
-      {% endif %}
-
-      {% if p.get("interests") %}
-      <p class="side-note">兴趣：{{ "、".join(p.get("interests", [])[:6]) }}</p>
-      {% endif %}
-      {% if p.get("looking_for") %}
-      <p class="side-note">交友期待：{{ p.get("looking_for") }}</p>
-      {% endif %}
-      {% if p.get("conversation_style") %}
-      <p class="side-note">沟通偏好：{{ p.get("conversation_style") }}</p>
-      {% endif %}
-      {% if p.get("boundaries") %}
-      <p class="side-note">边界：{{ "、".join(p.get("boundaries", [])[:4]) }}</p>
-      {% endif %}
-      {% if p.get("context_memory") %}
-      <p class="side-note">长期记忆：</p>
-      <ul class="memory-list">
-        {% for mem in p.get("context_memory", [])[:4] %}
-        <li>{{ mem }}</li>
-        {% endfor %}
-      </ul>
-      {% endif %}
-    </section>
 
     {% if agent %}
     <section class="side-block">
@@ -83,25 +63,122 @@
   </aside>
 
   <section class="console-main">
-    <div class="kpi-grid">
-      <article class="kpi-card card-premium">
-        <span>当前推荐</span>
-        <strong>{{ recommendations|length }}</strong>
-      </article>
-      <article class="kpi-card card-premium">
-        <span>私信会话</span>
-        <strong>{{ direct_messages|length }}</strong>
-      </article>
-      <article class="kpi-card card-premium">
-        <span>探索记录</span>
-        <strong>{{ discovery_sessions|length }}</strong>
-      </article>
-    </div>
+    <section class="dashboard-stage card-premium">
+      <div class="stage-top">
+        <div class="stage-crumb">控制台 / {{ tab_label }}</div>
+        <div class="stage-actions">
+          {% if agent %}
+          <a href="/chat/{{ agent.id }}" class="btn btn-chat-main btn-sm">立即和 Agent 聊天</a>
+          {% endif %}
+          <div class="stage-badges">
+          <span class="stage-badge">推荐 {{ recommendations_total }}</span>
+          <span class="stage-badge">私聊 {{ direct_messages|length }}</span>
+          <span class="stage-badge">探索 {{ discovery_total }}</span>
+          </div>
+        </div>
+      </div>
+      <div class="stage-tabs">
+        <a href="{{ dashboard_url(tab='home') }}" class="stage-tab{% if active_tab == 'home' %} active{% endif %}">主页</a>
+        <a href="{{ dashboard_url(tab='dm') }}" class="stage-tab{% if active_tab == 'dm' %} active{% endif %}">私聊</a>
+        <a href="{{ dashboard_url(tab='decision') }}" class="stage-tab{% if active_tab == 'decision' %} active{% endif %}">推荐决策</a>
+        <a href="{{ dashboard_url(tab='discovery') }}" class="stage-tab{% if active_tab == 'discovery' %} active{% endif %}">探索过程</a>
+        <a href="{{ dashboard_url(tab='community') }}" class="stage-tab{% if active_tab == 'community' %} active{% endif %}">社区 Agent</a>
+      </div>
+    </section>
 
-    <section class="panel card-premium">
-      <div class="panel-head">
-        <h3>私信入口</h3>
-        <small>双方互相同意后自动生成</small>
+    {% if active_tab == "home" %}
+    <section class="home-hero card-premium">
+      <div class="home-hero-head">
+        <h2>Agent 社交控制台</h2>
+        <span class="status-chip">{{ "探索中" if discovery_running else "空闲" }}</span>
+      </div>
+      <p>主页保持极简。左侧切换到「私聊」「推荐决策」「探索过程」「社区 Agent」查看详细内容。</p>
+      <div class="kpi-grid minimal-kpi-grid">
+        <article class="kpi-card card-premium">
+          <span>当前推荐</span>
+          <strong>{{ recommendations_total }}</strong>
+        </article>
+        <article class="kpi-card card-premium">
+          <span>私聊会话</span>
+          <strong>{{ direct_messages|length }}</strong>
+        </article>
+        <article class="kpi-card card-premium">
+          <span>探索记录</span>
+          <strong>{{ discovery_total }}</strong>
+        </article>
+      </div>
+    </section>
+
+    <section class="profile-grid">
+      <article class="profile-card card-premium">
+        <div class="profile-head">
+          <div>
+            <h3>用户画像</h3>
+            <small>多轮对话增量整理</small>
+          </div>
+          <span class="profile-dot"></span>
+        </div>
+        <div class="profile-block">
+          <label>兴趣</label>
+          {% if p.get("interests") %}
+          <div class="chip-group">
+            {% for item in p.get("interests", [])[:8] %}
+            <span class="chip">{{ item }}</span>
+            {% endfor %}
+          </div>
+          {% else %}
+          <p class="profile-empty">暂无兴趣标签</p>
+          {% endif %}
+        </div>
+        <div class="profile-block">
+          <label>目标</label>
+          <p>{{ p.get("looking_for") if p.get("looking_for") else "暂无明确目标" }}</p>
+        </div>
+      </article>
+
+      <article class="profile-card card-premium">
+        <div class="profile-head">
+          <div>
+            <h3>Agent 画像</h3>
+            <small>用于推荐与私信风格控制</small>
+          </div>
+          <span class="profile-dot profile-dot-gold"></span>
+        </div>
+        <div class="profile-block">
+          <label>性格特征</label>
+          {% if p.get("traits") %}
+          <div class="chip-group">
+            {% for item in p.get("traits", [])[:8] %}
+            <span class="chip">{{ item }}</span>
+            {% endfor %}
+          </div>
+          {% else %}
+          <p class="profile-empty">暂无性格标签</p>
+          {% endif %}
+        </div>
+        <div class="profile-block">
+          <label>长期记忆</label>
+          {% if p.get("context_memory") %}
+          <ul class="memory-list profile-memory-list">
+            {% for item in p.get("context_memory", [])[:4] %}
+            <li>{{ item }}</li>
+            {% endfor %}
+          </ul>
+          {% else %}
+          <p class="profile-empty">暂无长期记忆条目</p>
+          {% endif %}
+        </div>
+      </article>
+    </section>
+
+    {% elif active_tab == "dm" %}
+    <section class="panel card-premium tab-panel">
+      <div class="panel-title-row">
+        <div class="title-group">
+          <h3>私聊入口</h3>
+          <small>与已互选用户的私信会话</small>
+        </div>
+        <span class="panel-page">共 {{ direct_messages|length }} 个会话</span>
       </div>
       {% if direct_messages %}
       <div class="dm-list">
@@ -111,7 +188,7 @@
             <strong>{{ dm.peer_username }}</strong>
             <span>{{ dm.last_message_at.strftime('%Y-%m-%d %H:%M') if dm.last_message_at else '' }}</span>
           </div>
-          <p class="dm-agent">对方Agent：{{ dm.peer_agent_name }}</p>
+          <p class="dm-agent">对方 Agent：{{ dm.peer_agent_name }}</p>
           <p class="dm-preview">{{ dm.last_message if dm.last_message else "暂无消息，点击进入发起私信" }}</p>
         </a>
         {% endfor %}
@@ -121,10 +198,26 @@
       {% endif %}
     </section>
 
-    <section class="panel card-premium">
-      <div class="panel-head">
-        <h3>推荐决策</h3>
-        <small>支持同意 / 拒绝并创建后续会话</small>
+    {% elif active_tab == "decision" %}
+    <section class="panel card-premium tab-panel">
+      <div class="panel-title-row">
+        <div class="title-group">
+          <h3>推荐决策</h3>
+          <small>查看推荐理由并执行同意或拒绝</small>
+        </div>
+        <span class="panel-nav">
+          {% if rec_has_prev %}
+          <a href="{{ dashboard_url(tab='decision', rec_p=rec_page - 1) }}">上一页</a>
+          {% else %}
+          <span class="nav-disabled">上一页</span>
+          {% endif %}
+          <span class="panel-page">{{ rec_page }}/{{ (recommendations_total // rec_page_size) + (1 if recommendations_total % rec_page_size else 0) if recommendations_total else 1 }}</span>
+          {% if rec_has_next %}
+          <a href="{{ dashboard_url(tab='decision', rec_p=rec_page + 1) }}">下一页</a>
+          {% else %}
+          <span class="nav-disabled">下一页</span>
+          {% endif %}
+        </span>
       </div>
       {% if recommendations %}
       <div class="rec-list">
@@ -133,33 +226,15 @@
           <div class="rec-top">
             <span class="rec-score">{{ rec.score }}%</span>
             <span class="status-chip">
-              {% if rec.status == "mutual" %}
-              已互相同意
-              {% elif rec.status == "rejected" %}
-              已拒绝
-              {% elif rec.from_approved or rec.to_approved %}
-              等待对方确认
-              {% else %}
-              待处理
-              {% endif %}
+              {% if rec.status == "mutual" %}已互相同意{% elif rec.status == "rejected" %}已拒绝{% elif rec.from_approved or rec.to_approved %}等待对方确认{% else %}待处理{% endif %}
             </span>
           </div>
           <p class="rec-reason">{{ rec.reason }}</p>
-          <p class="rec-pair">{{ rec.from_agent_name }} → {{ rec.to_agent_name }}</p>
-
+          <p class="rec-pair">{{ rec.from_agent_name }} -> {{ rec.to_agent_name }}</p>
           {% if rec.status not in ("mutual", "rejected") %}
           <div class="actions">
             <form action="/rec/{{ rec.id }}/approve" method="post">
-              <button
-                type="submit"
-                class="btn btn-primary btn-sm"
-                {% if (rec.is_from_me and rec.from_approved) or (rec.is_to_me and rec.to_approved) %}disabled{% endif %}>
-                {% if (rec.is_from_me and rec.from_approved) or (rec.is_to_me and rec.to_approved) %}
-                已同意
-                {% else %}
-                同意推荐
-                {% endif %}
-              </button>
+              <button type="submit" class="btn btn-primary btn-sm" {% if (rec.is_from_me and rec.from_approved) or (rec.is_to_me and rec.to_approved) %}disabled{% endif %}>{{ "已同意" if (rec.is_from_me and rec.from_approved) or (rec.is_to_me and rec.to_approved) else "同意推荐" }}</button>
             </form>
             <form action="/rec/{{ rec.id }}/reject" method="post">
               <button type="submit" class="btn btn-outline btn-sm">拒绝推荐</button>
@@ -170,14 +245,30 @@
         {% endfor %}
       </div>
       {% else %}
-      <div class="empty-block">暂无推荐，先让Agent去后台探索。</div>
+      <div class="empty-block">暂无推荐，先让 Agent 去后台探索。</div>
       {% endif %}
     </section>
 
-    <section class="panel card-premium">
-      <div class="panel-head">
-        <h3>探索过程</h3>
-        <small>点击查看Agent之间的完整对话</small>
+    {% elif active_tab == "discovery" %}
+    <section class="panel card-premium tab-panel">
+      <div class="panel-title-row">
+        <div class="title-group">
+          <h3>探索过程</h3>
+          <small>Agent 间多轮对话与匹配轨迹</small>
+        </div>
+        <span class="panel-nav">
+          {% if disc_has_prev %}
+          <a href="{{ dashboard_url(tab='discovery', disc_p=disc_page - 1) }}">上一页</a>
+          {% else %}
+          <span class="nav-disabled">上一页</span>
+          {% endif %}
+          <span class="panel-page">{{ disc_page }}/{{ (discovery_total // disc_page_size) + (1 if discovery_total % disc_page_size else 0) if discovery_total else 1 }}</span>
+          {% if disc_has_next %}
+          <a href="{{ dashboard_url(tab='discovery', disc_p=disc_page + 1) }}">下一页</a>
+          {% else %}
+          <span class="nav-disabled">下一页</span>
+          {% endif %}
+        </span>
       </div>
       {% if discovery_sessions %}
       <div class="discovery-list">
@@ -187,10 +278,7 @@
             <strong>{{ item.peer_agent_name }}</strong>
             <span>{{ item.created_at.strftime('%Y-%m-%d %H:%M') if item.created_at else '' }}</span>
           </div>
-          <p class="discovery-meta">
-            共 {{ item.message_count }} 轮
-            {% if item.matched %} · 匹配 {{ item.score }}%{% else %} · 暂未匹配{% endif %}
-          </p>
+          <p class="discovery-meta">共 {{ item.message_count }} 轮 {% if item.matched %} · 匹配 {{ item.score }}%{% else %} · 暂未匹配{% endif %}</p>
           <p class="discovery-preview">{{ item.last_message if item.last_message else "暂无消息" }}</p>
         </a>
         {% endfor %}
@@ -200,11 +288,40 @@
       {% endif %}
     </section>
 
-    <section class="panel card-premium">
-      <div class="panel-head">
-        <h3>社区Agent</h3>
-        <small>可用于探索匹配的候选池</small>
+    {% elif active_tab == "community" %}
+    <section class="panel card-premium tab-panel">
+      <div class="panel-title-row">
+        <div class="title-group">
+          <h3>社区 Agent</h3>
+          <small>检索社区并筛选潜在匹配对象</small>
+        </div>
+        <span class="panel-nav">
+          {% if community_has_prev %}
+          <a href="{{ dashboard_url(tab='community', comm_p=community_page - 1) }}">上一页</a>
+          {% else %}
+          <span class="nav-disabled">上一页</span>
+          {% endif %}
+          <span class="panel-page">{{ community_page }}/{{ (community_total // community_page_size) + (1 if community_total % community_page_size else 0) if community_total else 1 }}</span>
+          {% if community_has_next %}
+          <a href="{{ dashboard_url(tab='community', comm_p=community_page + 1) }}">下一页</a>
+          {% else %}
+          <span class="nav-disabled">下一页</span>
+          {% endif %}
+        </span>
       </div>
+
+      <form action="/dashboard" method="get" class="community-search-row">
+        <input type="hidden" name="tab" value="community">
+        <input type="text" name="community_q" value="{{ community_query }}" placeholder="搜索 Agent 名称或用户名">
+        <button type="submit" class="btn btn-outline btn-sm">搜索</button>
+        <input type="hidden" name="community_page" value="1">
+        <input type="hidden" name="community_page_size" value="{{ community_page_size }}">
+        <input type="hidden" name="rec_page" value="{{ rec_page }}">
+        <input type="hidden" name="rec_page_size" value="{{ rec_page_size }}">
+        <input type="hidden" name="disc_page" value="{{ disc_page }}">
+        <input type="hidden" name="disc_page_size" value="{{ disc_page_size }}">
+      </form>
+
       {% if other_agents %}
       <div class="community-grid">
         {% for a in other_agents %}
@@ -221,9 +338,56 @@
         {% endfor %}
       </div>
       {% else %}
-      <div class="empty-block">社区里暂无其他Agent。</div>
+      <div class="empty-block">当前筛选条件下暂无社区 Agent。</div>
       {% endif %}
     </section>
+    {% endif %}
+
+    <footer class="dashboard-footer-settings card-premium">
+      <div class="footer-settings-head">
+        <strong>页面设置</strong>
+        <small>统一调整分页密度，简化页面管理</small>
+      </div>
+      <form action="/dashboard" method="get" class="footer-settings-form">
+        <input type="hidden" name="tab" value="{{ active_tab }}">
+        <div class="footer-settings-grid">
+          <div class="setting-item">
+            <label for="rec_page_size">推荐每页</label>
+            <select id="rec_page_size" name="rec_page_size">
+              {% for size in [4, 6, 8, 10, 12] %}
+              <option value="{{ size }}" {% if rec_page_size == size %}selected{% endif %}>{{ size }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="setting-item">
+            <label for="disc_page_size">探索每页</label>
+            <select id="disc_page_size" name="disc_page_size">
+              {% for size in [4, 6, 8, 10, 12] %}
+              <option value="{{ size }}" {% if disc_page_size == size %}selected{% endif %}>{{ size }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="setting-item">
+            <label for="community_page_size">社区每页</label>
+            <select id="community_page_size" name="community_page_size">
+              {% for size in [12, 18, 24, 30, 36] %}
+              <option value="{{ size }}" {% if community_page_size == size %}selected{% endif %}>{{ size }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+
+        <input type="hidden" name="rec_page" value="1">
+        <input type="hidden" name="disc_page" value="1">
+        <input type="hidden" name="community_page" value="1">
+        <input type="hidden" name="community_q" value="{{ community_query }}">
+        <div class="footer-settings-actions">
+          <button type="submit" class="btn btn-primary btn-sm">应用设置</button>
+        </div>
+      </form>
+    </footer>
   </section>
 </div>
 
