@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="chat-shell">
+  <header class="chat-header card-premium">
+    <a href="/dashboard" class="back-btn" aria-label="返回控制台">←</a>
+    <div class="chat-avatar">探</div>
+    <div class="chat-header-meta">
+      <strong>探索会话 #{{ conversation_id }}</strong>
+      <small>{% if matched %}已匹配（{{ score }}%）{% else %}未达成推荐{% endif %}</small>
+    </div>
+  </header>
+
+  <section class="chat-messages card-premium" id="chatMessages">
+    {% if transcript %}
+    {% for m in transcript %}
+    <article class="msg {% if m.is_me %}msg-user{% else %}msg-agent{% endif %}">
+      <div class="msg-bubble">
+        <strong>{{ m.speaker }}：</strong>{{ m.content }}
+      </div>
+      <time class="msg-time">{{ m.created_at.strftime('%Y-%m-%d %H:%M') if m.created_at else '' }}</time>
+    </article>
+    {% endfor %}
+    {% else %}
+    <div class="chat-empty">
+      <p>当前会话暂无可展示内容。</p>
+    </div>
+    {% endif %}
+  </section>
+</div>
+
+<script>
+  (function () {
+    var messages = document.getElementById('chatMessages');
+    if (messages) messages.scrollTop = messages.scrollHeight;
+  })();
+</script>
+{% endblock %}

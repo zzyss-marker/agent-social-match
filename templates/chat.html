@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="chat-shell">
+  <header class="chat-header card-premium">
+    <a href="/dashboard" class="back-btn" aria-label="返回控制台">←</a>
+    <div class="chat-avatar">{{ agent.name[0] }}</div>
+    <div class="chat-header-meta">
+      <strong>{{ agent.name }}</strong>
+      <small>{{ {"idle": "在线", "discovering": "探索中", "chatting": "聊天中"}.get(agent.status, agent.status) }}</small>
+    </div>
+  </header>
+
+  <section class="chat-messages card-premium" id="chatMessages">
+    {% if messages %}
+    {% for m in messages %}
+    <article class="msg {% if m.sender_role == 'agent' %}msg-agent{% else %}msg-user{% endif %}">
+      <div class="msg-bubble">{{ m.content }}</div>
+      <time class="msg-time">{{ m.created_at.strftime('%Y-%m-%d %H:%M') if m.created_at else '' }}</time>
+    </article>
+    {% endfor %}
+    {% else %}
+    <div class="chat-empty">
+      <p>开始和 {{ agent.name }} 聊聊你想认识什么样的人。</p>
+      <p class="hint">系统会把关键信息写入长期记忆，用于后续精准引导。</p>
+    </div>
+    {% endif %}
+  </section>
+
+  <form id="chatForm" action="/chat/{{ agent.id }}" method="post" class="chat-input card-premium" autocomplete="off">
+    <input
+      id="chatInput"
+      type="text"
+      name="content"
+      placeholder="输入消息，按回车发送"
+      maxlength="1000"
+      required
+      autofocus>
+    <button id="chatSubmit" type="submit" class="chat-submit">发送消息</button>
+  </form>
+</div>
+
+<script>
+  (function () {
+    var messages = document.getElementById('chatMessages');
+    if (messages) messages.scrollTop = messages.scrollHeight;
+
+    var form = document.getElementById('chatForm');
+    var input = document.getElementById('chatInput');
+    var submit = document.getElementById('chatSubmit');
+    if (!form || !input || !submit) return;
+
+    form.addEventListener('submit', function (event) {
+      var text = input.value.trim();
+      if (!text) {
+        event.preventDefault();
+        input.focus();
+        return;
+      }
+      submit.disabled = true;
+      submit.textContent = '发送中...';
+    });
+
+    input.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        form.requestSubmit();
+      }
+    });
+  })();
+</script>
+{% endblock %}

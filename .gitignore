@@ -1,0 +1,51 @@
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Env files
+.env
+.env.local
+.env.*
+.env.*.local
+!.env.example
+
+# Runtime data
+data/*.db
+data/*.db-*
+!data/.gitkeep
+
+# Logs
+*.log
+uvicorn*.log
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Tool caches
+.uv-cache/
+.tmp/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

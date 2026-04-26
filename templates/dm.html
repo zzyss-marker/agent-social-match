@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="chat-shell">
+  <header class="chat-header card-premium">
+    <a href="/dashboard" class="back-btn" aria-label="返回控制台">←</a>
+    <div class="chat-avatar">{{ peer_username[0] if peer_username else "U" }}</div>
+    <div class="chat-header-meta">
+      <strong>{{ peer_username }}</strong>
+      <small>对方Agent：{{ peer_agent_name }}</small>
+    </div>
+  </header>
+
+  <section class="chat-messages card-premium" id="chatMessages">
+    {% if messages %}
+    {% for m in messages %}
+    <article class="msg {% if m.is_me %}msg-user{% else %}msg-agent{% endif %}">
+      <div class="msg-bubble">
+        {% if not m.is_me %}<strong>{{ m.sender_name }}：</strong>{% endif %}{{ m.content }}
+      </div>
+      <time class="msg-time">{{ m.created_at.strftime('%Y-%m-%d %H:%M') if m.created_at else '' }}</time>
+    </article>
+    {% endfor %}
+    {% else %}
+    <div class="chat-empty">
+      <p>还没有私信记录。</p>
+      <p class="hint">可以先打个招呼，开启正式交流。</p>
+    </div>
+    {% endif %}
+  </section>
+
+  <form id="dmForm" action="/dm/{{ conversation_id }}" method="post" class="chat-input card-premium" autocomplete="off">
+    <input
+      id="dmInput"
+      type="text"
+      name="content"
+      placeholder="输入私信内容"
+      maxlength="1000"
+      required
+      autofocus>
+    <button id="dmSubmit" type="submit" class="chat-submit">发送私信</button>
+  </form>
+</div>
+
+<script>
+  (function () {
+    var messages = document.getElementById('chatMessages');
+    if (messages) messages.scrollTop = messages.scrollHeight;
+
+    var form = document.getElementById('dmForm');
+    var input = document.getElementById('dmInput');
+    var submit = document.getElementById('dmSubmit');
+    if (!form || !input || !submit) return;
+
+    form.addEventListener('submit', function (event) {
+      var text = input.value.trim();
+      if (!text) {
+        event.preventDefault();
+        input.focus();
+        return;
+      }
+      submit.disabled = true;
+      submit.textContent = '发送中...';
+    });
+  })();
+</script>
+{% endblock %}

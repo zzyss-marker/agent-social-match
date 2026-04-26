@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block content %}
+
+<a href="/" class="back-link">← 返回首页</a>
+
+<!-- 当前用户信息卡 -->
+<div class="profile-banner">
+  <div class="profile-banner-avatar" style="background: #4F46E5;">{{ user.name[0] | upper }}</div>
+  <div class="profile-banner-info">
+    <h2>{{ user.name }}</h2>
+    <div class="profile-banner-meta">
+      <span class="tag tag-intent">{{ '💕 找伴侣' if user.intent == 'partner' else '💬 找搭子' }}</span>
+      <span>{{ user.age }}岁</span>
+      <span>📍 {{ user.city }}</span>
+      <span>🗣 {{ {'direct':'直率爽快','warm':'温暖亲切','thoughtful':'深思熟虑','humorous':'幽默风趣'}.get(user.communication_style, user.communication_style) }}</span>
+    </div>
+    <p class="profile-banner-desc">{{ user.agent_summary }}</p>
+  </div>
+</div>
+
+<div class="section-header">
+  <h3>为你推荐 ({{ recommendations|length }} 人)</h3>
+  <input type="text" id="matchSearch" placeholder="🔍 筛选..." class="search-bar">
+</div>
+
+{% if recommendations %}
+<div class="match-grid" id="matchGrid">
+  {% for row in recommendations %}
+  {% set c = row.candidate %}
+  <div class="match-card {% if row.mutual %}match-card-mutual{% endif %}" data-searchable="{{ c.name|lower }} {{ c.city|lower }} {{ c.intent|lower }}">
+    <!-- 互配徽章 -->
+    {% if row.mutual %}
+    <div class="mutual-badge">💝 双方互配</div>
+    {% elif row.liked_you %}
+    <div class="liked-badge">💗 对方喜欢你</div>
+    {% endif %}
+
+    <!-- 头像 -->
+    <div class="match-avatar" style="background: {{ ['#4F46E5','#7C3AED','#DB2777','#EA580C','#2563EB','#059669','#D97706','#DC2626','#6366F1','#0891B2'] | random }}">
+      {{ c.name[0] | upper }}
+    </div>
+
+    <!-- 基本信息 -->
+    <div class="match-name">{{ c.name }}</div>
+    <div class="match-info">
+      <span>{{ c.age }}岁</span>
+      <span>{{ c.city }}</span>
+    </div>
+    <div class="match-intent">
+      <span class="tag tag-intent">{{ '💕 找伴侣' if c.intent == 'partner' else '💬 找搭子' }}</span>
+    </div>
+
+    <!-- 匹配分数 -->
+    <div class="match-score-section">
+      <div class="match-score-ring">
+        <svg viewBox="0 0 100 100">
+          <circle class="ring-bg" cx="50" cy="50" r="42" />
+          <circle class="ring-fill" cx="50" cy="50" r="42"
+                  stroke-dasharray="{{ (row.score * 264) | int }}, 264"
+                  stroke="{% if row.score >= 0.7 %}#059669{% elif row.score >= 0.4 %}#2563EB{% else %}#D97706{% endif %}" />
+        </svg>
+        <span class="score-number">{{ (row.score * 100) | int }}<small>%</small></span>
+      </div>
+      <span class="score-label">匹配度</span>
+    </div>
+
+    <!-- 匹配原因 -->
+    <div class="match-reasons">
+      {% for reason in row.reasons[:3] %}
+      <div class="reason-item">{{ reason }}</div>
+      {% endfor %}
+    </div>
+
+    <!-- 操作按钮 -->
+    <div class="match-action">
+      {% if row.mutual %}
+      <button class="btn btn-mutual btn-full" disabled>💝 已互配</button>
+      {% elif row.liked_by_user %}
+      <button class="btn btn-liked btn-full" disabled>✓ 已发送喜欢</button>
+      {% else %}
+      <button class="btn btn-like btn-full like-btn"
+              data-user-id="{{ user.id }}"
+              data-candidate-id="{{ c.id }}">
+        💗 喜欢
+      </button>
+      {% endif %}
+    </div>
+
+    <!-- 状态标签 -->
+    <div class="match-status">
+      {% if row.mutual %}
+      <span class="status-dot mutual"></span> 互配成功
+      {% elif row.liked_by_user %}
+      <span class="status-dot sent"></span> 已发送
+      {% elif row.liked_you %}
+      <span class="status-dot incoming"></span> 对方喜欢
+      {% else %}
+      <span class="status-dot none"></span> 未连接
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+  <div class="empty-icon">🔍</div>
+  <h4>暂无匹配推荐</h4>
+  <p>还没有找到与你兼容的用户。尝试扩充用户池或调整你的偏好设置。</p>
+</div>
+{% endif %}
+{% endblock %}
