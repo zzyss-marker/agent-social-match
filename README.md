@@ -35,35 +35,6 @@
 
 ![Agent 聊天页](./assets/readme/chat_agent.png)
 
-## 技术/科技配图（网络调研）
-
-> 仅保留工程技术风格配图，来源均为 Wikimedia Commons。  
-> 具体许可以各文件页为准（README 已保留原始来源链接）。
-
-### 数据中心机房（Infra）
-
-![Data Center](https://commons.wikimedia.org/wiki/Special:FilePath/Data%20Center%20%2822370911658%29.jpg)
-
-来源：<https://commons.wikimedia.org/wiki/File:Data_Center_(22370911658).jpg>
-
-### 网络拓扑（Network Architecture）
-
-![Network Topologies](https://commons.wikimedia.org/wiki/Special:FilePath/NetworkTopologies.svg)
-
-来源：<https://commons.wikimedia.org/wiki/File:NetworkTopologies.svg>
-
-### 神经网络结构示意（Model）
-
-![Neural network example](https://commons.wikimedia.org/wiki/Special:FilePath/Neural%20network%20example.svg)
-
-来源：<https://commons.wikimedia.org/wiki/File:Neural_network_example.svg>
-
-### AI 芯片概念图（Compute）
-
-![Artificial Neural Network with Chip](https://commons.wikimedia.org/wiki/Special:FilePath/Artificial_Neural_Network_with_Chip.jpg)
-
-来源：<https://commons.wikimedia.org/wiki/File:Artificial_Neural_Network_with_Chip.jpg>
-
 ## 产品定位
 
 **Agent Social Match** 不是“聊聊天就结束”的机器人项目，而是一个完整的交友流程系统：
@@ -72,7 +43,7 @@
 2. Agent 后台主动和其他 Agent 对话，进行发现与匹配评估。
 3. 双向同意后进入私信（DM），把“推荐”变成“可行动的连接”。
 
-## 什么是 Agent（作业核心）
+## 什么是 Agent
 
 在本项目里，**Agent 不是一个简单聊天窗口**，而是一个具备明确职责的“可持续运行的软件角色”。
 
@@ -87,7 +58,7 @@
 
 ## 如何自定义构建 Agent（DeepSeek / Qwen）
 
-你的作业题目要求“支持自定义基于 DeepSeek 或 Qwen 的 Agent”，本项目已经按 OpenAI 兼容接口实现了底座，切换成本很低。
+本项目按 OpenAI 兼容接口实现了模型接入底座，可灵活切换 DeepSeek 或 Qwen。
 
 ### 1) 模型接入（Provider 可切换）
 
@@ -131,7 +102,7 @@ LLM_MODEL="qwen-plus"
 
 你可以把它理解为“模型输出之后的产品策略闸门”。
 
-### 4) 学生日常场景落地方式（可直接写进作业）
+### 4) 学生日常场景落地方式
 
 可扩展为以下 Agent：
 
@@ -316,7 +287,7 @@ sequenceDiagram
 - 成本收益：每提升 1% 互选率所需 token/时延成本
 - 安全审计：跑题、敏感信息幻觉、越界建议比例
 
-可直接用于作业答辩的结论模板：
+推荐用于实验复盘的结论模板：
 
 1. 哪个方案在**效果-成本-稳定性**最均衡  
 2. 阈值如何影响“推荐数量 vs 推荐质量”  
