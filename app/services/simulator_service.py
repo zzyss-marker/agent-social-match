@@ -52,7 +52,13 @@ async def generate_simulated_users(
         await session.flush()
 
         results.append({
-            "user": UserResponse(id=user.id, username=user.username, created_at=user.created_at),
+            "user": UserResponse(
+                id=user.id,
+                username=user.username,
+                email=user.email,
+                email_verified=user.email_verified,
+                created_at=user.created_at,
+          ),
             "agent": AgentResponse(
                 id=agent.id, user_id=agent.user_id, name=agent.name,
                 personality=agent.personality, status=agent.status,
