@@ -1024,12 +1024,22 @@ def create_app() -> FastAPI:
         agent_id: int,
         content: str = Form(...),
     ):
+        accept_header = request.headers.get("accept", "").lower()
+        wants_json = (
+            request.headers.get("x-requested-with", "").lower() == "xmlhttprequest"
+            or "application/json" in accept_header
+        )
+
         user_id = request.session.get("user_id")
         if user_id is None:
+            if wants_json:
+                return JSONResponse(status_code=401, content={"ok": False, "message": "未登录"})
             return RedirectResponse(url="/", status_code=303)
 
         clean_content = (content or "").strip()
         if not clean_content:
+            if wants_json:
+                return JSONResponse(status_code=400, content={"ok": False, "message": "消息不能为空"})
             return RedirectResponse(url=f"/chat/{agent_id}", status_code=303)
 
         session_factory = request.app.state.session_factory
@@ -1039,7 +1049,7 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail="Agent不存在")
 
             conv = await chat_service.get_or_create_user_agent_conv(session, user_id)
-            await chat_service.send_message(session, conv.id, "user", user_id, clean_content)
+            user_msg = await chat_service.send_message(session, conv.id, "user", user_id, clean_content)
 
             messages = await chat_service.get_messages(session, conv.id)
             recent_messages = messages[-30:]
@@ -1074,7 +1084,7 @@ def create_app() -> FastAPI:
                     )
                     agent_reply = fallback_reply
 
-            await chat_service.send_message(session, conv.id, "agent", agent_resp.id, agent_reply)
+            agent_msg = await chat_service.send_message(session, conv.id, "agent", agent_resp.id, agent_reply)
 
             # 每 3 条用户消息增量整理一次画像和上下文记忆。
             user_turns = sum(1 for m in recent_messages if m.sender_role == "user")
@@ -1102,6 +1112,22 @@ def create_app() -> FastAPI:
                     )
 
             await session.commit()
+        if wants_json:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "ok": True,
+                    "conversation_id": conv.id,
+                    "user_message": {
+                        "content": user_msg.content,
+                        "created_at": format_utc8(user_msg.created_at),
+                    },
+                    "agent_message": {
+                        "content": agent_msg.content,
+                        "created_at": format_utc8(agent_msg.created_at),
+                    },
+                },
+            )
         return RedirectResponse(url=f"/chat/{agent_id}", status_code=303)
 
     @app.get("/discovery-chat/{conversation_id}", response_class=HTMLResponse)

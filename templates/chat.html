@@ -49,21 +49,109 @@
     var submit = document.getElementById('chatSubmit');
     if (!form || !input || !submit) return;
 
+    var isSending = false;
+
+    function nowText() {
+      var now = new Date();
+      var y = now.getFullYear();
+      var m = String(now.getMonth() + 1).padStart(2, '0');
+      var d = String(now.getDate()).padStart(2, '0');
+      var hh = String(now.getHours()).padStart(2, '0');
+      var mm = String(now.getMinutes()).padStart(2, '0');
+      return y + '-' + m + '-' + d + ' ' + hh + ':' + mm;
+    }
+
+    function removeEmptyState() {
+      var empty = messages ? messages.querySelector('.chat-empty') : null;
+      if (empty) empty.remove();
+    }
+
+    function appendMessage(role, content, timeText) {
+      if (!messages) return null;
+      removeEmptyState();
+
+      var article = document.createElement('article');
+      article.className = 'msg ' + (role === 'agent' ? 'msg-agent' : 'msg-user');
+
+      var bubble = document.createElement('div');
+      bubble.className = 'msg-bubble';
+      bubble.textContent = content;
+
+      var time = document.createElement('time');
+      time.className = 'msg-time';
+      time.textContent = timeText || nowText();
+
+      article.appendChild(bubble);
+      article.appendChild(time);
+      messages.appendChild(article);
+      messages.scrollTop = messages.scrollHeight;
+      return article;
+    }
+
     form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      if (isSending) return;
+
       var text = input.value.trim();
       if (!text) {
-        event.preventDefault();
         input.focus();
         return;
       }
+
+      isSending = true;
+      var pendingUser = appendMessage('user', text, nowText());
+      input.value = '';
+      input.focus();
       submit.disabled = true;
       submit.textContent = '发送中...';
+
+      var payload = new FormData();
+      payload.append('content', text);
+
+      fetch(form.action, {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest'
+        },
+        body: payload
+      }).then(function (res) {
+        return res.json().then(function (data) {
+          return { ok: res.ok, data: data };
+        }).catch(function () {
+          return { ok: false, data: null };
+        });
+      }).then(function (result) {
+        if (!result.ok || !result.data || !result.data.ok) {
+          throw new Error((result.data && result.data.message) ? result.data.message : '发送失败');
+        }
+
+        if (pendingUser && result.data.user_message && result.data.user_message.created_at) {
+          var t = pendingUser.querySelector('.msg-time');
+          if (t) t.textContent = result.data.user_message.created_at;
+        }
+
+        if (result.data.agent_message && result.data.agent_message.content) {
+          appendMessage('agent', result.data.agent_message.content, result.data.agent_message.created_at || nowText());
+        }
+      }).catch(function () {
+        appendMessage('agent', '发送失败，请重试。', nowText());
+      }).finally(function () {
+        isSending = false;
+        submit.disabled = false;
+        submit.textContent = '发送消息';
+      });
     });
 
     input.addEventListener('keydown', function (event) {
+      if (isSending) return;
       if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
-        form.requestSubmit();
+        if (typeof form.requestSubmit === 'function') {
+          form.requestSubmit(submit);
+        } else {
+          form.dispatchEvent(new Event('submit', { cancelable: true }));
+        }
       }
     });
   })();
