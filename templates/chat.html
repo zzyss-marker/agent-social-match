@@ -15,7 +15,7 @@
     {% for m in messages %}
     <article class="msg {% if m.sender_role == 'agent' %}msg-agent{% else %}msg-user{% endif %}">
       <div class="msg-bubble">{{ m.content }}</div>
-      <time class="msg-time">{{ m.created_at.strftime('%Y-%m-%d %H:%M') if m.created_at else '' }}</time>
+      <time class="msg-time">{{ m.created_at | fmt_utc8 }}</time>
     </article>
     {% endfor %}
     {% else %}

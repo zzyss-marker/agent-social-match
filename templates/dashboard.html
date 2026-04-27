@@ -186,7 +186,7 @@
         <a class="dm-card" href="/dm/{{ dm.conversation_id }}">
           <div class="dm-top">
             <strong>{{ dm.peer_username }}</strong>
-            <span>{{ dm.last_message_at.strftime('%Y-%m-%d %H:%M') if dm.last_message_at else '' }}</span>
+            <span>{{ dm.last_message_at | fmt_utc8 }}</span>
           </div>
           <p class="dm-agent">对方 Agent：{{ dm.peer_agent_name }}</p>
           <p class="dm-preview">{{ dm.last_message if dm.last_message else "暂无消息，点击进入发起私信" }}</p>
@@ -276,7 +276,7 @@
         <a class="discovery-card" href="/discovery-chat/{{ item.conversation_id }}">
           <div class="discovery-top">
             <strong>{{ item.peer_agent_name }}</strong>
-            <span>{{ item.created_at.strftime('%Y-%m-%d %H:%M') if item.created_at else '' }}</span>
+            <span>{{ item.created_at | fmt_utc8 }}</span>
           </div>
           <p class="discovery-meta">共 {{ item.message_count }} 轮 {% if item.matched %} · 匹配 {{ item.score }}%{% else %} · 暂未匹配{% endif %}</p>
           <p class="discovery-preview">{{ item.last_message if item.last_message else "暂无消息" }}</p>

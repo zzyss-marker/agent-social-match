@@ -4,13 +4,14 @@ import asyncio
 import random
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.core.time_utils import ensure_utc8, now_utc8
 from app.models.models import (
     Agent,
     Conversation,
@@ -72,20 +73,18 @@ def _calibrate_score(raw_score: int, confidence: int) -> int:
     return max(0, min(100, int(round(calibrated))))
 
 
-def _as_aware_utc(dt: datetime | None) -> datetime:
-    if dt is None:
-        return datetime.now(UTC)
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC)
-
+def _as_aware_utc8(dt: datetime | None) -> datetime:
+    localized = ensure_utc8(dt)
+    if localized is None:
+        return now_utc8()
+    return localized
 
 async def _load_blocked_targets(
     session: AsyncSession,
     agent_id: int,
     cooldown_hours: int,
 ) -> set[int]:
-    since = datetime.now(UTC) - timedelta(hours=max(1, cooldown_hours))
+    since = now_utc8() - timedelta(hours=max(1, cooldown_hours))
     rows = (
         await session.execute(
             select(
@@ -105,7 +104,7 @@ async def _load_blocked_targets(
     blocked: set[int] = set()
     for from_id, to_id, status, created_at in rows:
         peer_id = to_id if from_id == agent_id else from_id
-        created = _as_aware_utc(created_at)
+        created = _as_aware_utc8(created_at)
         if status == "pending" or created >= since:
             blocked.add(int(peer_id))
     return blocked

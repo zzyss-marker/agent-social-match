@@ -2,7 +2,6 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -21,6 +20,7 @@ from app.core.config import Settings, resolve_data_dir
 from app.core.database import create_engine, create_session_factory
 from app.core.exceptions import AppException
 from app.core.logging_setup import setup_logging
+from app.core.time_utils import format_utc8, now_utc8
 from app.models.base import Base
 from app.models.models import Agent, Conversation, ConversationParticipant, Message, Recommendation, User
 from app.schemas.common import ErrorDetail
@@ -203,7 +203,7 @@ def _merge_profile(old_profile: Any, new_profile: Any) -> dict[str, Any]:
 
     snapshots = old_norm["snapshots"] + [
         {
-            "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "updated_at": now_utc8().isoformat(timespec="seconds"),
             "traits": traits[:8],
             "interests": interests[:8],
             "looking_for": looking_for,
@@ -358,6 +358,7 @@ def create_app() -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+    templates.env.filters["fmt_utc8"] = format_utc8
     app.include_router(api_router)
 
     @app.exception_handler(AppException)
