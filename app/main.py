@@ -3,9 +3,9 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import structlog
 from fastapi import FastAPI, Form, HTTPException, Request
@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, inspect, or_, select, text
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import Response
 
 from app.api.router import api_router
 from app.core.config import Settings, resolve_data_dir
@@ -31,7 +32,6 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
 
 logger = structlog.get_logger(__name__)
-SESSION_SECRET = os.environ.get("SESSION_SECRET", "matchmaking-dev-secret-key-2026")
 _DISCOVERY_TASKS: dict[int, asyncio.Task] = {}
 
 
@@ -297,11 +297,64 @@ async def lifespan(app: FastAPI):
     logger.info("app_shutdown")
 
 
+def _is_weak_secret(secret: str) -> bool:
+    normalized = secret.strip()
+    weak_values = {"", "change-me", "replace-with-a-random-long-secret", "matchmaking-dev-secret-key-2026"}
+    return len(normalized) < 32 or normalized.lower() in weak_values
+
+
+def _is_same_origin(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    expected_origin = f"{request.url.scheme}://{request.url.netloc}"
+    if origin:
+        return origin == expected_origin
+
+    referer = request.headers.get("referer")
+    if not referer:
+        return True
+
+    parsed = urlparse(referer)
+    referer_origin = f"{parsed.scheme}://{parsed.netloc}"
+    return referer_origin == expected_origin
+
+
 def create_app() -> FastAPI:
     settings = Settings()
+    if settings.SECURITY_REQUIRE_STRONG_SECRETS and not settings.DEBUG:
+        if _is_weak_secret(settings.SESSION_SECRET):
+            raise RuntimeError("SESSION_SECRET 过弱或未配置，请在 .env 设置一个至少 32 位的随机字符串")
+        if _is_weak_secret(settings.EMAIL_CODE_SECRET):
+            raise RuntimeError("EMAIL_CODE_SECRET 过弱或未配置，请在 .env 设置一个至少 32 位的随机字符串")
+
     app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan)
     app.state.settings = settings
-    app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=settings.SESSION_SECRET,
+        max_age=settings.SESSION_MAX_AGE_SECONDS,
+        same_site=settings.SESSION_SAMESITE,
+        https_only=settings.SESSION_HTTPS_ONLY,
+    )
+
+    @app.middleware("http")
+    async def add_security_headers(request: Request, call_next):
+        session_user_id = None
+        try:
+            session_user_id = request.session.get("user_id")
+        except Exception:
+            session_user_id = None
+
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and session_user_id is not None:
+            if not _is_same_origin(request):
+                return JSONResponse(status_code=403, content={"detail": "跨站请求被拒绝"})
+
+        response: Response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        response.headers.setdefault("Content-Security-Policy", "default-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+        return response
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -1276,6 +1329,8 @@ def create_app() -> FastAPI:
 
     @app.post("/simulate-web")
     async def simulate_web(request: Request, count: int = Form(8)):
+        if not request.app.state.settings.DEBUG:
+            raise HTTPException(status_code=403, detail="生产环境已禁用模拟数据生成")
         session_factory = request.app.state.session_factory
         async with session_factory() as session:
             await simulator_service.generate_simulated_users(

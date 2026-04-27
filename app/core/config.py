@@ -13,7 +13,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    APP_NAME: str = "Agent Matchmaking"
+    APP_NAME: str = "Agent Social Match"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
 
@@ -44,6 +44,12 @@ class Settings(BaseSettings):
 
     # Auth / email verification
     AUTH_PASSWORD_MIN_LENGTH: int = 8
+    SESSION_SECRET: str = ""
+    SESSION_MAX_AGE_SECONDS: int = 60 * 60 * 24 * 14
+    SESSION_SAMESITE: Literal["lax", "strict", "none"] = "lax"
+    SESSION_HTTPS_ONLY: bool = False
+    SECURITY_REQUIRE_STRONG_SECRETS: bool = True
+
     EMAIL_CODE_TTL_MINUTES: int = 10
     EMAIL_CODE_RESEND_COOLDOWN_SECONDS: int = 60
     EMAIL_CODE_MAX_ATTEMPTS: int = 5

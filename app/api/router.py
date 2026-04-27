@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, get_llm, get_settings
 from app.core.config import Settings
+from app.models.models import Agent, ConversationParticipant
 from app.schemas.schemas import (
     AgentResponse,
     ConversationResponse,
@@ -24,6 +25,13 @@ from app.services.llm_client import LLMClient
 api_router = APIRouter(prefix="/api")
 
 
+def _require_user_id(request: Request) -> int:
+    user_id = request.session.get("user_id")
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="请先登录")
+    return int(user_id)
+
+
 # Auth
 @api_router.post("/register/email-code")
 async def send_register_email_code(
@@ -37,7 +45,7 @@ async def send_register_email_code(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail="验证码发送失败，请稍后重试")
 
 
 @api_router.post("/register")
@@ -54,7 +62,10 @@ async def register(
 
 
 @api_router.get("/users/{user_id}", response_model=UserResponse)
-async def get_user(user_id: int, session: AsyncSession = Depends(get_db)):
+async def get_user(user_id: int, request: Request, session: AsyncSession = Depends(get_db)):
+    current_user_id = _require_user_id(request)
+    if user_id != current_user_id:
+        raise HTTPException(status_code=403, detail="无权访问该用户信息")
     user = await auth_service.get_user(session, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
@@ -63,10 +74,13 @@ async def get_user(user_id: int, session: AsyncSession = Depends(get_db)):
 
 # Agent
 @api_router.get("/agents/{agent_id}", response_model=AgentResponse)
-async def get_agent(agent_id: int, session: AsyncSession = Depends(get_db)):
+async def get_agent(agent_id: int, request: Request, session: AsyncSession = Depends(get_db)):
+    current_user_id = _require_user_id(request)
     agent = await auth_service.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent 不存在")
+    if agent.user_id != current_user_id:
+        raise HTTPException(status_code=403, detail="无权访问该Agent信息")
     return agent
 
 
@@ -77,9 +91,7 @@ async def start_user_agent_chat(
     session: AsyncSession = Depends(get_db),
 ) -> ConversationResponse:
     """Get or create the user-agent conversation for current user."""
-    user_id = request.session.get("user_id")
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="请先登录")
+    user_id = _require_user_id(request)
     return await chat_service.get_or_create_user_agent_conv(session, user_id)
 
 
@@ -88,17 +100,26 @@ async def list_conversations(
     request: Request,
     session: AsyncSession = Depends(get_db),
 ) -> list[ConversationResponse]:
-    user_id = request.session.get("user_id")
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="请先登录")
+    user_id = _require_user_id(request)
     return await chat_service.list_user_conversations(session, user_id)
 
 
 @api_router.get("/conversations/{conv_id}/messages")
 async def get_messages(
+    request: Request,
     conv_id: int,
     session: AsyncSession = Depends(get_db),
 ) -> list[MessageResponse]:
+    user_id = _require_user_id(request)
+    participant = await session.execute(
+        select(ConversationParticipant.id).where(
+            (ConversationParticipant.conversation_id == conv_id)
+            & (ConversationParticipant.entity_type == "user")
+            & (ConversationParticipant.entity_id == user_id)
+        )
+    )
+    if participant.scalar_one_or_none() is None:
+        raise HTTPException(status_code=403, detail="无权访问该对话")
     return await chat_service.get_messages(session, conv_id)
 
 
@@ -112,9 +133,7 @@ async def send_message(
     settings: Settings = Depends(get_settings),
 ) -> dict:
     """Send message. If user->agent, agent replies via LLM."""
-    user_id = request.session.get("user_id")
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="请先登录")
+    user_id = _require_user_id(request)
 
     conv = await chat_service.get_or_create_user_agent_conv(session, user_id)
     if conv.id != conv_id:
@@ -191,9 +210,7 @@ async def run_discovery(
     llm: LLMClient = Depends(get_llm),
     settings: Settings = Depends(get_settings),
 ):
-    user_id = request.session.get("user_id")
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="请先登录")
+    user_id = _require_user_id(request)
 
     # Ensure this agent belongs to current user
     agent = await auth_service.get_agent(session, data.agent_id)
@@ -211,9 +228,7 @@ async def list_recommendations(
 ) -> list[RecommendationResponse]:
     from app.models.models import Recommendation
 
-    user_id = request.session.get("user_id")
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="请先登录")
+    user_id = _require_user_id(request)
 
     # My agent
     result = await session.execute(select(Agent).where(Agent.user_id == user_id))
@@ -259,9 +274,7 @@ async def approve_recommendation(
 ) -> dict:
     from app.models.models import Conversation, ConversationParticipant, Recommendation
 
-    user_id = request.session.get("user_id")
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="请先登录")
+    user_id = _require_user_id(request)
 
     # Load rec
     result = await session.execute(select(Recommendation).where(Recommendation.id == rec_id))
@@ -315,9 +328,7 @@ async def reject_recommendation(
 ) -> dict:
     from app.models.models import Recommendation
 
-    user_id = request.session.get("user_id")
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="请先登录")
+    user_id = _require_user_id(request)
 
     result = await session.execute(select(Recommendation).where(Recommendation.id == rec_id))
     rec = result.scalar_one_or_none()
@@ -341,10 +352,14 @@ async def reject_recommendation(
 # Simulator
 @api_router.post("/simulator/generate")
 async def generate_simulated_users(
+    request: Request,
     count: int = Query(default=10, ge=1, le=200),
     session: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> dict:
+    _require_user_id(request)
+    if not settings.DEBUG:
+        raise HTTPException(status_code=403, detail="生产环境已禁用模拟数据生成")
     results = await simulator_service.generate_simulated_users(session, count, settings)
     return {"count": len(results), "items": results}
 
