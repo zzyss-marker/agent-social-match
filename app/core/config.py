@@ -42,6 +42,23 @@ class Settings(BaseSettings):
     DASHBOARD_DISCOVERY_PAGE_SIZE: int = 4
     DASHBOARD_MAX_PANEL_PAGE_SIZE: int = 20
 
+    # Auth / email verification
+    AUTH_PASSWORD_MIN_LENGTH: int = 8
+    EMAIL_CODE_TTL_MINUTES: int = 10
+    EMAIL_CODE_RESEND_COOLDOWN_SECONDS: int = 60
+    EMAIL_CODE_MAX_ATTEMPTS: int = 5
+    EMAIL_CODE_HOURLY_LIMIT: int = 5
+    EMAIL_CODE_DAILY_LIMIT: int = 20
+    EMAIL_CODE_SECRET: str = "change-me-email-code-secret"
+
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 465
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_SENDER: str = ""
+    SMTP_USE_SSL: bool = True
+    SMTP_USE_STARTTLS: bool = False
+
     # LLM API for agent interactions (configure via .env)
     LLM_BASE_URL: str = ""
     LLM_API_KEY: str = ""

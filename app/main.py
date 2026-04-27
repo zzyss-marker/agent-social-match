@@ -12,7 +12,7 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, inspect, or_, select, text
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.api.router import api_router
@@ -39,6 +39,98 @@ def LLMClient_from_settings(settings: Settings):
     from app.services.llm_client import LLMClient
 
     return LLMClient(settings)
+
+
+def _render_home(
+    templates: Jinja2Templates,
+    request: Request,
+) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request=request,
+        name="home.html",
+        context={"title": "首页"},
+        status_code=200,
+    )
+
+
+def _render_login(
+    templates: Jinja2Templates,
+    request: Request,
+    *,
+    error: str | None = None,
+    prefill: dict[str, str] | None = None,
+) -> HTMLResponse:
+    context: dict[str, Any] = {"title": "登录", "error": error}
+    if prefill:
+        context.update(prefill)
+    return templates.TemplateResponse(
+        request=request,
+        name="login.html",
+        context=context,
+        status_code=200,
+    )
+
+
+def _render_register(
+    templates: Jinja2Templates,
+    request: Request,
+    *,
+    error: str | None = None,
+    notice: str | None = None,
+    prefill: dict[str, str] | None = None,
+    email_cooldown_seconds: int = 60,
+) -> HTMLResponse:
+    context: dict[str, Any] = {"title": "注册", "error": error, "notice": notice}
+    if prefill:
+        context.update(prefill)
+    context["email_cooldown_seconds"] = email_cooldown_seconds
+    return templates.TemplateResponse(
+        request=request,
+        name="register.html",
+        context=context,
+        status_code=200,
+    )
+
+
+def _apply_startup_schema_patches(sync_conn) -> None:
+    """Backfill auth-related columns/tables for existing SQLite databases."""
+    inspector = inspect(sync_conn)
+    table_names = set(inspector.get_table_names())
+
+    if "users" in table_names:
+        user_columns = {col["name"] for col in inspector.get_columns("users")}
+        if "email" not in user_columns:
+            sync_conn.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR(255)"))
+        if "password_hash" not in user_columns:
+            sync_conn.execute(text("ALTER TABLE users ADD COLUMN password_hash VARCHAR(255)"))
+        if "email_verified" not in user_columns:
+            sync_conn.execute(text("ALTER TABLE users ADD COLUMN email_verified BOOLEAN NOT NULL DEFAULT 0"))
+        sync_conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_users_email ON users(email)"))
+
+    if "email_verification_codes" not in table_names:
+        sync_conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS email_verification_codes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email VARCHAR(255) NOT NULL,
+                    purpose VARCHAR(32) NOT NULL,
+                    code_hash VARCHAR(128) NOT NULL,
+                    expires_at DATETIME NOT NULL,
+                    used_at DATETIME NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+
+    sync_conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_email_codes_lookup "
+            "ON email_verification_codes(email, purpose, created_at)"
+        )
+    )
 
 
 def _normalize_profile(profile: Any) -> dict[str, Any]:
@@ -193,6 +285,7 @@ async def lifespan(app: FastAPI):
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_apply_startup_schema_patches)
 
     logger.info("app_startup", name=settings.APP_NAME, version=settings.APP_VERSION)
     yield
@@ -243,65 +336,248 @@ def create_app() -> FastAPI:
     async def index(request: Request) -> HTMLResponse:
         if request.session.get("user_id"):
             return RedirectResponse(url="/dashboard", status_code=303)
-        return templates.TemplateResponse(request=request, name="index.html", context={})
+        return _render_home(templates, request)
 
-    @app.post("/login")
-    async def login(request: Request, username: str = Form(...)):
-        clean_username = username.strip()
-        if not clean_username:
-            return templates.TemplateResponse(
-                request=request,
-                name="index.html",
-                context={"error": "用户名不能为空"},
-                status_code=200,
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page(request: Request) -> HTMLResponse:
+        if request.session.get("user_id"):
+            return RedirectResponse(url="/dashboard", status_code=303)
+        return _render_login(templates, request)
+
+    @app.get("/register", response_class=HTMLResponse)
+    async def register_page(request: Request) -> HTMLResponse:
+        if request.session.get("user_id"):
+            return RedirectResponse(url="/dashboard", status_code=303)
+        return _render_register(
+            templates,
+            request,
+            email_cooldown_seconds=request.app.state.settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+        )
+
+    @app.get("/register/check-availability")
+    async def register_check_availability(
+        request: Request,
+        field: str,
+        value: str,
+    ) -> JSONResponse:
+        field_key = field.strip().lower()
+        raw_value = value.strip()
+        if field_key not in {"username", "agent_name"}:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "available": False, "message": "不支持的检查字段"},
             )
+
+        if not raw_value:
+            return JSONResponse(content={"ok": True, "available": False, "message": "请输入内容后再检查"})
+
+        if field_key == "username" and len(raw_value) < 2:
+            return JSONResponse(content={"ok": True, "available": False, "message": "用户名至少 2 个字符"})
+        if len(raw_value) > 50:
+            return JSONResponse(content={"ok": True, "available": False, "message": "长度不能超过 50 个字符"})
 
         session_factory = request.app.state.session_factory
         async with session_factory() as session:
-            result = await session.execute(select(User).where(User.username == clean_username))
-            user = result.scalar_one_or_none()
-            if user is None:
-                return templates.TemplateResponse(
-                    request=request,
-                    name="index.html",
-                    context={"error": "用户不存在，请先注册"},
-                    status_code=200,
+            if field_key == "username":
+                exists_result = await session.execute(
+                    select(func.count(User.id)).where(func.lower(User.username) == raw_value.lower())
                 )
+                available = int(exists_result.scalar_one() or 0) == 0
+                message = "用户名可用" if available else "用户名已存在"
+                return JSONResponse(content={"ok": True, "available": available, "message": message})
+
+            exists_result = await session.execute(
+                select(func.count(Agent.id)).where(func.lower(Agent.name) == raw_value.lower())
+            )
+            available = int(exists_result.scalar_one() or 0) == 0
+            message = "Agent 名称可用" if available else "Agent 名称已存在"
+            return JSONResponse(content={"ok": True, "available": available, "message": message})
+
+    @app.post("/login")
+    async def login(
+        request: Request,
+        identifier: str = Form(...),
+        password: str = Form(""),
+    ):
+        clean_identifier = identifier.strip()
+        clean_password = password.strip()
+        if not clean_identifier:
+            return _render_login(templates, request, error="请输入用户名或邮箱")
+
+        session_factory = request.app.state.session_factory
+        async with session_factory() as session:
+            user = await auth_service.get_user_by_identifier(session, clean_identifier)
+            if user is None:
+                return _render_login(
+                    templates,
+                    request,
+                    error="账号不存在，请先注册",
+                    prefill={"login_identifier": clean_identifier},
+                )
+
+            if not user.password_hash:
+                return _render_login(
+                    templates,
+                    request,
+                    error="该账号为旧版本数据，请重新注册并绑定邮箱后登录",
+                    prefill={"login_identifier": clean_identifier},
+                )
+
+            if not clean_password or not auth_service.verify_password(clean_password, user.password_hash):
+                return _render_login(
+                    templates,
+                    request,
+                    error="密码错误",
+                    prefill={"login_identifier": clean_identifier},
+                )
+
+            if not user.email_verified:
+                return _render_login(
+                    templates,
+                    request,
+                    error="邮箱未验证，请完成邮箱验证后再登录",
+                    prefill={"login_identifier": clean_identifier},
+                )
+
             request.session["user_id"] = user.id
         return RedirectResponse(url="/dashboard", status_code=303)
+
+    @app.post("/register/send-code")
+    async def send_register_code(
+        request: Request,
+        email: str = Form(...),
+        username: str = Form(""),
+        agent_name: str = Form(""),
+    ):
+        clean_email = auth_service.normalize_email(email)
+        prefill = {
+            "register_email": clean_email,
+            "register_username": username.strip(),
+            "register_agent_name": agent_name.strip(),
+        }
+        if not auth_service.is_valid_email(clean_email):
+            return _render_register(
+                templates,
+                request,
+                error="邮箱格式不正确",
+                prefill=prefill,
+                email_cooldown_seconds=request.app.state.settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+            )
+
+        session_factory = request.app.state.session_factory
+        settings = request.app.state.settings
+        async with session_factory() as session:
+            try:
+                await auth_service.send_registration_code(session, clean_email, settings)
+                await session.commit()
+            except ValueError as exc:
+                await session.rollback()
+                return _render_register(
+                    templates,
+                    request,
+                    error=str(exc),
+                    prefill=prefill,
+                    email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+                )
+            except Exception as exc:
+                await session.rollback()
+                logger.error("send_register_code_failed", error=str(exc), exc_info=True)
+                return _render_register(
+                    templates,
+                    request,
+                    error="验证码发送失败，请检查邮箱服务配置",
+                    prefill=prefill,
+                    email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+                )
+
+        return _render_register(
+            templates,
+            request,
+            notice=f"验证码已发送至 {clean_email}，{settings.EMAIL_CODE_TTL_MINUTES} 分钟内有效",
+            prefill=prefill,
+            email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+        )
 
     @app.post("/register")
     async def register_web(
         request: Request,
         username: str = Form(...),
+        email: str = Form(...),
+        password: str = Form(...),
+        confirm_password: str = Form(...),
+        verification_code: str = Form(...),
         agent_name: str = Form(...),
     ):
         clean_username = username.strip()
+        clean_email = auth_service.normalize_email(email)
+        clean_password = password.strip()
+        clean_confirm_password = confirm_password.strip()
+        clean_verification_code = verification_code.strip()
         clean_agent_name = agent_name.strip()
-        if not clean_username or not clean_agent_name:
-            return templates.TemplateResponse(
-                request=request,
-                name="index.html",
-                context={"error": "用户名和Agent名称不能为空"},
-                status_code=200,
+        prefill = {
+            "register_username": clean_username,
+            "register_email": clean_email,
+            "register_agent_name": clean_agent_name,
+        }
+
+        if (
+            not clean_username
+            or not clean_email
+            or not clean_password
+            or not clean_verification_code
+            or not clean_agent_name
+        ):
+            return _render_register(
+                templates,
+                request,
+                error="注册信息不完整，请填写用户名、邮箱、密码、验证码和 Agent 名称",
+                prefill=prefill,
+                email_cooldown_seconds=request.app.state.settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+            )
+        if clean_password != clean_confirm_password:
+            return _render_register(
+                templates,
+                request,
+                error="两次输入的密码不一致",
+                prefill=prefill,
+                email_cooldown_seconds=request.app.state.settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
             )
 
         session_factory = request.app.state.session_factory
+        settings = request.app.state.settings
         async with session_factory() as session:
             try:
                 user, _ = await auth_service.register(
                     session,
-                    UserRegister(username=clean_username, agent_name=clean_agent_name),
+                    UserRegister(
+                        username=clean_username,
+                        email=clean_email,
+                        password=clean_password,
+                        verification_code=clean_verification_code,
+                        agent_name=clean_agent_name,
+                    ),
+                    settings,
                 )
                 await session.commit()
                 request.session["user_id"] = user.id
-            except Exception:
+            except ValueError as exc:
                 await session.rollback()
-                return templates.TemplateResponse(
-                    request=request,
-                    name="index.html",
-                    context={"error": "注册失败，用户名可能已存在"},
-                    status_code=200,
+                return _render_register(
+                    templates,
+                    request,
+                    error=str(exc),
+                    prefill=prefill,
+                    email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+                )
+            except Exception as exc:
+                await session.rollback()
+                logger.error("register_failed", error=str(exc), exc_info=True)
+                return _render_register(
+                    templates,
+                    request,
+                    error="注册失败，请稍后重试",
+                    prefill=prefill,
+                    email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
                 )
         return RedirectResponse(url="/dashboard", status_code=303)
 

@@ -1,23 +1,32 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime
 
 from pydantic import BaseModel, Field
 
 
-# ── Auth ──
+# Auth
+class EmailCodeRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=255)
+
+
 class UserRegister(BaseModel):
     username: str = Field(min_length=2, max_length=50)
+    email: str = Field(min_length=5, max_length=255)
+    password: str = Field(min_length=8, max_length=128)
+    verification_code: str = Field(min_length=4, max_length=16)
     agent_name: str = Field(min_length=1, max_length=50)
 
 
 class UserResponse(BaseModel):
     id: int
     username: str
+    email: str | None
+    email_verified: bool
     created_at: datetime
 
 
-# ── Agent ──
+# Agent
 class AgentResponse(BaseModel):
     id: int
     user_id: int
@@ -31,7 +40,7 @@ class AgentUpdate(BaseModel):
     name: str | None = None
 
 
-# ── Messages ──
+# Messages
 class MessageCreate(BaseModel):
     content: str
 
@@ -45,7 +54,7 @@ class MessageResponse(BaseModel):
     created_at: datetime
 
 
-# ── Conversations ──
+# Conversations
 class ConversationResponse(BaseModel):
     id: int
     conv_type: str
@@ -54,7 +63,7 @@ class ConversationResponse(BaseModel):
     created_at: datetime
 
 
-# ── Recommendations ──
+# Recommendations
 class RecommendationResponse(BaseModel):
     id: int
     from_agent_name: str

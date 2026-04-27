@@ -1,0 +1,108 @@
+﻿{% extends "base.html" %}
+{% block content %}
+<div class="auth-solo-page">
+  <div class="auth-solo-orb auth-solo-orb-a"></div>
+  <div class="auth-solo-orb auth-solo-orb-b"></div>
+
+  <a href="/" class="auth-solo-back">返回首页</a>
+
+  <section class="auth-solo-card card-premium">
+    <div class="auth-solo-head">
+      <span class="apple-logo"></span>
+      <h1>注册</h1>
+    </div>
+
+    <form
+      id="send-code-form"
+      action="/register"
+      method="post"
+      class="form-stack"
+      data-cooldown-sec="{{ email_cooldown_seconds or 60 }}"
+    >
+      <label for="register-username">用户名</label>
+      <input
+        id="register-username"
+        type="text"
+        name="username"
+        placeholder="设置你的用户名"
+        value="{{ register_username or '' }}"
+        required
+      >
+      <small id="register-username-hint" class="field-hint availability-hint">至少 2 个字符，输入后自动检查是否可用</small>
+
+      <label for="register-email">邮箱</label>
+      <small class="field-hint">输入邮箱后发送验证码</small>
+      <div class="inline-field">
+      <input
+        id="register-email"
+        type="email"
+        name="email"
+        placeholder="请输入你收验证码的邮箱"
+        value="{{ register_email or '' }}"
+        required
+      >
+        <button
+          id="send-code-btn"
+          type="submit"
+          class="btn btn-outline"
+          formaction="/register/send-code"
+          formmethod="post"
+          formnovalidate
+        >发送验证码</button>
+      </div>
+
+      <label for="register-code">验证码</label>
+      <input
+        id="register-code"
+        type="text"
+        name="verification_code"
+        placeholder="请输入邮箱验证码"
+        inputmode="numeric"
+        required
+      >
+
+      <label for="register-password">密码</label>
+      <input
+        id="register-password"
+        type="password"
+        name="password"
+        placeholder="至少 8 位，包含字母和数字"
+        required
+      >
+
+      <label for="register-confirm-password">确认密码</label>
+      <input
+        id="register-confirm-password"
+        type="password"
+        name="confirm_password"
+        placeholder="再次输入密码"
+        required
+      >
+
+      <label for="register-agent">Agent 名称</label>
+      <input
+        id="register-agent"
+        type="text"
+        name="agent_name"
+        placeholder="例如：小澜 / 星野 / 阿木"
+        value="{{ register_agent_name or '' }}"
+        required
+      >
+      <small id="register-agent-hint" class="field-hint availability-hint">建议使用有辨识度的 Agent 名称</small>
+
+      <button id="register-submit-btn" type="submit" class="btn btn-gold btn-full">注册并创建 Agent</button>
+    </form>
+
+    <p class="auth-solo-switch">已有账户？<a href="/login">登录</a></p>
+
+    {% if notice %}
+    <p class="notice-text">{{ notice }}</p>
+    <div id="email-code-sent-flag" data-email="{{ register_email or '' }}" data-cooldown-sec="{{ email_cooldown_seconds or 60 }}"></div>
+    {% endif %}
+
+    {% if error %}
+    <p class="error-text">{{ error }}</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,45 @@
+﻿{% extends "base.html" %}
+{% block content %}
+<div class="auth-solo-page">
+  <div class="auth-solo-orb auth-solo-orb-a"></div>
+  <div class="auth-solo-orb auth-solo-orb-b"></div>
+
+  <a href="/" class="auth-solo-back">返回首页</a>
+
+  <section class="auth-solo-card card-premium">
+    <div class="auth-solo-head">
+      <span class="apple-logo"></span>
+      <h1>登录</h1>
+    </div>
+
+    <form action="/login" method="post" class="form-stack">
+      <label for="login-identifier">用户名或邮箱</label>
+      <input
+        id="login-identifier"
+        type="text"
+        name="identifier"
+        placeholder="请输入用户名或邮箱"
+        value="{{ login_identifier or '' }}"
+        required
+      >
+
+      <label for="login-password">密码</label>
+      <input
+        id="login-password"
+        type="password"
+        name="password"
+        placeholder="请输入密码"
+        required
+      >
+
+      <button type="submit" class="btn btn-primary btn-full">使用邮箱或用户名登录</button>
+    </form>
+
+    <p class="auth-solo-switch">没有账户？<a href="/register">注册</a></p>
+
+    {% if error %}
+    <p class="error-text">{{ error }}</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}
