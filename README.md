@@ -11,6 +11,10 @@
 
 > 以下截图由 Selenium 自动化流程基于 `PyJa` 账号登录后采集，展示的是系统当前真实页面数据。
 
+### 产品主页
+
+![产品主页](./assets/readme/homepage_landing.png)
+
 ### 控制台首页
 
 ![控制台首页](./assets/readme/dashboard_home.png)
