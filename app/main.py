@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import base64
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ from app.models.base import Base
 from app.models.models import Agent, Conversation, ConversationParticipant, Message, Recommendation, User
 from app.schemas.common import ErrorDetail
 from app.schemas.schemas import UserRegister
-from app.services import auth_service, chat_service, discovery_service, simulator_service
+from app.services import auth_service, avatar_service, chat_service, discovery_service, simulator_service
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = BASE_DIR / "templates"
@@ -33,12 +34,69 @@ STATIC_DIR = BASE_DIR / "static"
 
 logger = structlog.get_logger(__name__)
 _DISCOVERY_TASKS: dict[int, asyncio.Task] = {}
+_AVATAR_BACKFILL_TASK: asyncio.Task | None = None
 
 
 def LLMClient_from_settings(settings: Settings):
     from app.services.llm_client import LLMClient
 
     return LLMClient(settings)
+
+
+def svg_data_uri(svg: str | None) -> str:
+    if not svg:
+        return ""
+    encoded = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
+
+
+async def _run_avatar_backfill_loop(app: FastAPI) -> None:
+    session_factory = app.state.session_factory
+    settings = app.state.settings
+    llm = app.state.llm
+    interval = max(10, settings.AVATAR_BACKFILL_INTERVAL_SECONDS)
+
+    while True:
+        try:
+            async with session_factory() as session:
+                generated = await avatar_service.backfill_agent_avatars(
+                    session=session,
+                    llm=llm,
+                    settings=settings,
+                )
+                await session.commit()
+                if generated:
+                    logger.info("avatar_backfill_generated", count=generated)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("avatar_backfill_failed", error=str(exc), exc_info=True)
+
+        await asyncio.sleep(interval)
+
+
+def _trigger_avatar_generation_for_agent(app: FastAPI, agent_id: int) -> None:
+    async def _task() -> None:
+        session_factory = app.state.session_factory
+        async with session_factory() as session:
+            try:
+                await avatar_service.trigger_single_agent_avatar(
+                    session=session,
+                    agent_id=agent_id,
+                    llm=app.state.llm,
+                    settings=app.state.settings,
+                )
+                await session.commit()
+            except Exception as exc:
+                await session.rollback()
+                logger.warning(
+                    "avatar_generate_single_failed",
+                    agent_id=agent_id,
+                    error=str(exc),
+                    exc_info=True,
+                )
+
+    asyncio.create_task(_task())
 
 
 def _render_home(
@@ -106,6 +164,23 @@ def _apply_startup_schema_patches(sync_conn) -> None:
         if "email_verified" not in user_columns:
             sync_conn.execute(text("ALTER TABLE users ADD COLUMN email_verified BOOLEAN NOT NULL DEFAULT 0"))
         sync_conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_users_email ON users(email)"))
+
+    if "agents" in table_names:
+        agent_columns = {col["name"] for col in inspector.get_columns("agents")}
+        if "avatar_svg" not in agent_columns:
+            sync_conn.execute(text("ALTER TABLE agents ADD COLUMN avatar_svg TEXT"))
+        if "avatar_attempts" not in agent_columns:
+            sync_conn.execute(text("ALTER TABLE agents ADD COLUMN avatar_attempts INTEGER NOT NULL DEFAULT 0"))
+        if "avatar_last_error" not in agent_columns:
+            sync_conn.execute(text("ALTER TABLE agents ADD COLUMN avatar_last_error VARCHAR(255)"))
+        if "avatar_next_retry_at" not in agent_columns:
+            sync_conn.execute(text("ALTER TABLE agents ADD COLUMN avatar_next_retry_at DATETIME"))
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_agents_avatar_retry "
+                "ON agents(avatar_next_retry_at, avatar_attempts)"
+            )
+        )
 
     if "email_verification_codes" not in table_names:
         sync_conn.execute(
@@ -274,6 +349,7 @@ async def _run_discovery_background(app: FastAPI, agent_id: int) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _AVATAR_BACKFILL_TASK
     settings = app.state.settings
     setup_logging(settings)
     resolve_data_dir(settings.DATABASE_URL)
@@ -287,12 +363,18 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_apply_startup_schema_patches)
 
+    if settings.AVATAR_GENERATION_ENABLED:
+        _AVATAR_BACKFILL_TASK = asyncio.create_task(_run_avatar_backfill_loop(app))
+
     logger.info("app_startup", name=settings.APP_NAME, version=settings.APP_VERSION)
     yield
     for task in list(_DISCOVERY_TASKS.values()):
         if not task.done():
             task.cancel()
     _DISCOVERY_TASKS.clear()
+    if _AVATAR_BACKFILL_TASK is not None and not _AVATAR_BACKFILL_TASK.done():
+        _AVATAR_BACKFILL_TASK.cancel()
+    _AVATAR_BACKFILL_TASK = None
     await engine.dispose()
     logger.info("app_shutdown")
 
@@ -359,6 +441,7 @@ def create_app() -> FastAPI:
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     templates.env.filters["fmt_utc8"] = format_utc8
+    templates.env.filters["svg_data_uri"] = svg_data_uri
     app.include_router(api_router)
 
     @app.exception_handler(AppException)
@@ -599,9 +682,10 @@ def create_app() -> FastAPI:
 
         session_factory = request.app.state.session_factory
         settings = request.app.state.settings
+        created_agent_id: int | None = None
         async with session_factory() as session:
             try:
-                user, _ = await auth_service.register(
+                user, agent = await auth_service.register(
                     session,
                     UserRegister(
                         username=clean_username,
@@ -614,6 +698,7 @@ def create_app() -> FastAPI:
                 )
                 await session.commit()
                 request.session["user_id"] = user.id
+                created_agent_id = agent.id
             except ValueError as exc:
                 await session.rollback()
                 return _render_register(
@@ -633,6 +718,8 @@ def create_app() -> FastAPI:
                     prefill=prefill,
                     email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
                 )
+        if created_agent_id is not None:
+            _trigger_avatar_generation_for_agent(request.app, created_agent_id)
         return RedirectResponse(url="/dashboard", status_code=303)
 
     @app.get("/logout")
@@ -791,6 +878,7 @@ def create_app() -> FastAPI:
                         "name": other.name,
                         "personality": other.personality or {},
                         "status": other.status,
+                        "avatar_svg": other.avatar_svg,
                     }
                     for other in others_result.scalars().all()
                 ]
@@ -963,6 +1051,7 @@ def create_app() -> FastAPI:
                     "name": agent.name,
                     "personality": agent.personality or {},
                     "status": agent.status,
+                    "avatar_svg": agent.avatar_svg,
                 }
                 if agent
                 else None,

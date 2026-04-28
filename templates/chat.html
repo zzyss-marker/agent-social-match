@@ -3,7 +3,13 @@
 <div class="chat-shell">
   <header class="chat-header card-premium">
     <a href="/dashboard" class="back-btn" aria-label="返回控制台">←</a>
-    <div class="chat-avatar">{{ agent.name[0] }}</div>
+    <div class="chat-avatar">
+      {% if agent.avatar_svg %}
+      <img src="{{ agent.avatar_svg | svg_data_uri }}" alt="{{ agent.name }}" class="avatar-svg-img">
+      {% else %}
+      {{ agent.name[0] }}
+      {% endif %}
+    </div>
     <div class="chat-header-meta">
       <strong>{{ agent.name }}</strong>
       <small>{{ {"idle": "在线", "discovering": "探索中", "chatting": "聊天中"}.get(agent.status, agent.status) }}</small>

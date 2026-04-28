@@ -40,6 +40,10 @@ class Agent(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(50), nullable=False)
     personality: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="idle")  # idle, discovering, chatting
+    avatar_svg: Mapped[str | None] = mapped_column(Text, nullable=True)
+    avatar_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    avatar_last_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    avatar_next_retry_at: Mapped["datetime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped["User"] = relationship("User", back_populates="agent")
 

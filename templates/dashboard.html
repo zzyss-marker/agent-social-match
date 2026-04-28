@@ -12,7 +12,13 @@
 <div class="console-layout">
   <aside class="console-side card-premium">
     <div class="side-profile">
-      <div class="avatar-badge">{{ agent.name[0] if agent else "?" }}</div>
+      <div class="avatar-badge">
+        {% if agent and agent.avatar_svg %}
+        <img src="{{ agent.avatar_svg | svg_data_uri }}" alt="{{ agent.name }}" class="avatar-svg-img">
+        {% else %}
+        {{ agent.name[0] if agent else "?" }}
+        {% endif %}
+      </div>
       <div>
         <strong>{{ agent.name if agent else "未创建 Agent" }}</strong>
         <small>
@@ -326,7 +332,13 @@
       <div class="community-grid">
         {% for a in other_agents %}
         <article class="community-card">
-          <div class="comm-avatar">{{ a.name[0] }}</div>
+          <div class="comm-avatar">
+            {% if a.avatar_svg %}
+            <img src="{{ a.avatar_svg | svg_data_uri }}" alt="{{ a.name }}" class="avatar-svg-img">
+            {% else %}
+            {{ a.name[0] }}
+            {% endif %}
+          </div>
           <strong>{{ a.name }}</strong>
           <small>{{ "在线" if a.status == "idle" else "忙碌中" }}</small>
           <div class="comm-tags">

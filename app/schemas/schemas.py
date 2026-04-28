@@ -33,6 +33,7 @@ class AgentResponse(BaseModel):
     name: str
     personality: dict
     status: str
+    avatar_svg: str | None = None
     created_at: datetime
 
 

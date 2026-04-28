@@ -24,6 +24,8 @@ class LLMClient:
         return headers
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+        connect_timeout = float(kwargs.pop("connect_timeout_seconds", 20.0))
+        read_timeout = float(kwargs.pop("timeout_seconds", 60.0))
         payload = {
             "model": kwargs.get("model", self.model),
             "messages": messages,
@@ -31,7 +33,7 @@ class LLMClient:
             "temperature": kwargs.get("temperature", self.temperature),
         }
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=20.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(read_timeout, connect=connect_timeout)) as client:
                 response = await client.post(
                     f"{self.base_url}/chat/completions",
                     headers=self._headers,
@@ -42,7 +44,11 @@ class LLMClient:
             detail = exc.response.text[:300]
             raise RuntimeError(f"LLM request failed: HTTP {exc.response.status_code}. {detail}") from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError(f"LLM request failed: {exc}") from exc
+            exc_name = exc.__class__.__name__
+            exc_text = str(exc).strip()
+            if not exc_text:
+                exc_text = repr(exc)
+            raise RuntimeError(f"LLM request failed: {exc_name}. {exc_text}") from exc
 
         return self._extract_message_text(response.json())
 

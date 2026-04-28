@@ -72,6 +72,13 @@ class Settings(BaseSettings):
     LLM_MAX_TOKENS: int = 1024
     LLM_TEMPERATURE: float = 0.7
 
+    # Agent avatar generation
+    AVATAR_GENERATION_ENABLED: bool = True
+    AVATAR_BACKFILL_INTERVAL_SECONDS: int = 30
+    AVATAR_BATCH_SIZE: int = 4
+    AVATAR_MAX_RETRIES: int = 8
+    AVATAR_RETRY_BASE_SECONDS: int = 30
+
 
 def resolve_data_dir(database_url: str) -> Path:
     """Ensure the directory for a SQLite database URL exists."""

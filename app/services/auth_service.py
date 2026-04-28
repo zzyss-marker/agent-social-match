@@ -311,6 +311,7 @@ async def register(
             name=agent.name,
             personality=agent.personality,
             status=agent.status,
+            avatar_svg=agent.avatar_svg,
             created_at=agent.created_at,
         ),
     )
@@ -357,6 +358,7 @@ async def get_agent(session: AsyncSession, agent_id: int) -> AgentResponse | Non
         name=agent.name,
         personality=agent.personality,
         status=agent.status,
+        avatar_svg=agent.avatar_svg,
         created_at=agent.created_at,
     )
 
@@ -372,5 +374,6 @@ async def get_agent_by_user(session: AsyncSession, user_id: int) -> AgentRespons
         name=agent.name,
         personality=agent.personality,
         status=agent.status,
+        avatar_svg=agent.avatar_svg,
         created_at=agent.created_at,
     )

@@ -62,6 +62,7 @@ async def generate_simulated_users(
             "agent": AgentResponse(
                 id=agent.id, user_id=agent.user_id, name=agent.name,
                 personality=agent.personality, status=agent.status,
+                avatar_svg=agent.avatar_svg,
                 created_at=agent.created_at,
             ),
         })
