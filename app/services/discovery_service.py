@@ -20,6 +20,12 @@ from app.models.models import (
     Recommendation,
 )
 from app.schemas.schemas import DiscoveryResponse
+from app.services.embedding_service import (
+    cosine_similarity,
+    ensure_agent_embedding,
+    personality_to_text,
+    strip_internal_fields,
+)
 from app.services.llm_client import LLMClient
 
 _DISCOVERY_LOCKS: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -43,7 +49,16 @@ def _to_set(value: Any) -> set[str]:
 
 
 def _prefilter_score(a: dict[str, Any], b: dict[str, Any]) -> float:
-    """Cheap retrieval score to reduce LLM calls when agent pool is large."""
+    """Cheap retrieval score to reduce LLM calls when agent pool is large.
+
+    现在等价于 _rule_overlap_score —— 保留作为单独的规则信号，
+    与向量 cosine 相似度在召回阶段加权融合。
+    """
+    return _rule_overlap_score(a, b)
+
+
+def _rule_overlap_score(a: dict[str, Any], b: dict[str, Any]) -> float:
+    """规则信号：兴趣/特征/looking_for/vibe 的集合重合度。"""
     a_traits = _to_set(a.get("traits"))
     b_traits = _to_set(b.get("traits"))
     a_interests = _to_set(a.get("interests"))
@@ -59,6 +74,23 @@ def _prefilter_score(a: dict[str, Any], b: dict[str, Any]) -> float:
     vibe_bonus = 1 if a_vibe and b_vibe and a_vibe == b_vibe else 0
 
     return (interest_overlap * 1.8) + (trait_overlap * 1.2) + (looking_bonus * 1.2) + (vibe_bonus * 0.8)
+
+
+def hybrid_recall_score(
+    rule_score: float,
+    vector_similarity: float,
+    *,
+    rule_weight: float = 0.4,
+    vector_weight: float = 0.6,
+) -> float:
+    """规则信号 + 向量 cosine 加权融合。
+
+    规则信号的取值大致 [0, ~6]，先压到 [0, 1]：min(rule_score / 6, 1)
+    向量 cosine 取值 [-1, 1]，先压到 [0, 1]：(cos + 1) / 2
+    """
+    rule_norm = max(0.0, min(rule_score / 6.0, 1.0))
+    vec_norm = max(0.0, min((vector_similarity + 1.0) / 2.0, 1.0))
+    return rule_weight * rule_norm + vector_weight * vec_norm
 
 
 def _calibrate_score(raw_score: int, confidence: int) -> int:
@@ -158,8 +190,11 @@ async def run_discovery(
         my_snapshot = AgentSnapshot(
             id=my_agent.id,
             name=my_agent.name,
-            personality=my_agent.personality or {},
+            personality=strip_internal_fields(my_agent.personality or {}),
         )
+
+        # 确保我自己的向量已生成
+        my_vector = await ensure_agent_embedding(session, my_agent, settings)
 
         blocked_targets = await _load_blocked_targets(
             session=session,
@@ -171,7 +206,15 @@ async def run_discovery(
         for candidate in candidates:
             if candidate.id in blocked_targets:
                 continue
-            score = _prefilter_score(my_snapshot.personality, candidate.personality or {})
+            # 1) 规则重合度
+            rule_score = _rule_overlap_score(my_snapshot.personality, candidate.personality or {})
+            # 2) 向量 cosine（候选向量按需生成）
+            try:
+                cand_vec = await ensure_agent_embedding(session, candidate, settings)
+                cos = cosine_similarity(my_vector, cand_vec) if my_vector and cand_vec else 0.0
+            except Exception:
+                cos = 0.0
+            score = hybrid_recall_score(rule_score, cos)
             scored.append((score, candidate))
 
         if not scored:
@@ -192,7 +235,11 @@ async def run_discovery(
 
         # Materialize snapshots before commits/rollbacks to avoid expired ORM lazy-load issues.
         selected_snapshots = [
-            AgentSnapshot(id=int(t.id), name=str(t.name), personality=t.personality or {})
+            AgentSnapshot(
+                id=int(t.id),
+                name=str(t.name),
+                personality=strip_internal_fields(t.personality or {}),
+            )
             for t in selected
         ]
 
