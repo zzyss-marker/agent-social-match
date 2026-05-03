@@ -276,6 +276,58 @@ class LLMClient:
         messages = [system] + conversation_history
         return await self.chat(messages)
 
+    async def agent_chat_turn_react(
+        self,
+        agent_name: str,
+        agent_personality: dict[str, Any],
+        conversation_history: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        """ReAct 风格的 Agent 对话回合：要求模型按 Thought / Action / Observation 结构产出。
+
+        返回字段：
+          - thought: 内部推理（仅日志，不发给对方）
+          - action: 真正要发给对方的话
+          - observation: 对对方上一句的解读（日志用）
+        若解析失败则降级把整段文本作为 action。
+
+        论文：ReAct (Yao et al. 2022, https://arxiv.org/abs/2210.03629)
+        """
+        profile = agent_personality.get("traits", [])
+        interests = agent_personality.get("interests", [])
+        looking_for = agent_personality.get("looking_for", "")
+        vibe = agent_personality.get("vibe", "")
+
+        system = {
+            "role": "system",
+            "content": (
+                f"你是 {agent_name}，一个社交 AI Agent，正在和另一位 Agent 聊天评估匹配度。\n"
+                f"性格特征：{', '.join(profile) if profile else '暂无'}\n"
+                f"兴趣爱好：{', '.join(interests) if interests else '暂无'}\n"
+                f"正在寻找：{looking_for or '暂无'}\n"
+                f"整体风格：{vibe or '自然友好'}\n"
+                "请严格按以下 JSON 结构输出（不要任何额外说明、不要代码块）：\n"
+                '{"thought":"内部推理：你打算说什么以及为什么（25字内）",'
+                '"observation":"对对方上一句的简短解读（20字内，没有就空字符串）",'
+                '"action":"要发给对方的话（中文口语，自然友好，不超过80字）"}'
+            ),
+        }
+        messages = [system] + conversation_history
+        try:
+            data = await self.chat_json(messages, temperature=0.4, max_tokens=260)
+        except Exception:
+            return {"thought": "", "observation": "", "action": ""}
+
+        if not isinstance(data, dict) or "raw" in data:
+            raw_text = ""
+            if isinstance(data, dict) and isinstance(data.get("raw"), str):
+                raw_text = data["raw"]
+            return {"thought": "", "observation": "", "action": str(raw_text or "").strip()}
+
+        action = str(data.get("action") or data.get("Action") or "").strip()
+        thought = str(data.get("thought") or data.get("Thought") or "").strip()
+        observation = str(data.get("observation") or data.get("Observation") or "").strip()
+        return {"thought": thought, "observation": observation, "action": action}
+
     async def evaluate_match(
         self,
         agent_a_name: str,
@@ -283,6 +335,8 @@ class LLMClient:
         agent_b_name: str,
         agent_b_profile: dict[str, Any],
         conversation_transcript: list[dict[str, Any]],
+        *,
+        temperature: float = 0.05,
     ) -> dict[str, Any]:
         system = {
             "role": "system",
@@ -301,4 +355,98 @@ class LLMClient:
             "以下是两位 Agent 的对话记录："
         )
         messages = [system, {"role": "user", "content": context}] + conversation_transcript
-        return await self.chat_json(messages, temperature=0.05, max_tokens=360)
+        return await self.chat_json(messages, temperature=temperature, max_tokens=360)
+
+    async def evaluate_match_self_consistent(
+        self,
+        agent_a_name: str,
+        agent_a_profile: dict[str, Any],
+        agent_b_name: str,
+        agent_b_profile: dict[str, Any],
+        conversation_transcript: list[dict[str, Any]],
+        *,
+        samples: int = 3,
+        temperatures: tuple[float, ...] = (0.0, 0.2, 0.4),
+    ) -> dict[str, Any]:
+        """Self-Consistency（Wang et al. 2022）：多次采样取中位数。
+
+        - 调用 evaluate_match 多次，每次用略不同的 temperature
+        - score / confidence 取中位数
+        - reason / highlights / risks 取"中位 score 对应的那次"
+        - 多了一个 sampled 字段记录所有采样原始结果，便于审计
+        """
+        import asyncio as _asyncio
+
+        n = max(1, samples)
+        temps = list(temperatures)[:n]
+        while len(temps) < n:
+            temps.append(0.05)
+
+        coros = [
+            self.evaluate_match(
+                agent_a_name,
+                agent_a_profile,
+                agent_b_name,
+                agent_b_profile,
+                conversation_transcript,
+                temperature=t,
+            )
+            for t in temps
+        ]
+        results: list[dict[str, Any]] = []
+        for r in await _asyncio.gather(*coros, return_exceptions=True):
+            if isinstance(r, dict):
+                results.append(r)
+
+        if not results:
+            return {
+                "compatible": False,
+                "score": 0,
+                "confidence": 0,
+                "reason": "评估失败：所有采样均异常",
+                "highlights": [],
+                "risks": ["evaluation_failed"],
+                "sampled": [],
+            }
+
+        def _safe_int(v: Any, default: int = 0) -> int:
+            try:
+                return max(0, min(100, int(v)))
+            except Exception:
+                return default
+
+        scores = sorted(_safe_int(r.get("score", 0)) for r in results)
+        confidences = sorted(_safe_int(r.get("confidence", 0)) for r in results)
+
+        # 中位数
+        mid_idx = len(scores) // 2
+        median_score = scores[mid_idx] if len(scores) % 2 else (scores[mid_idx - 1] + scores[mid_idx]) // 2
+        median_conf = confidences[mid_idx] if len(confidences) % 2 else (
+            confidences[mid_idx - 1] + confidences[mid_idx]
+        ) // 2
+
+        # 找最接近 median_score 的一次结果，用它的 reason / highlights / risks
+        anchor = min(
+            results,
+            key=lambda r: abs(_safe_int(r.get("score", 0)) - median_score),
+        )
+
+        compatible_votes = sum(1 for r in results if bool(r.get("compatible", False)))
+        compatible = compatible_votes > len(results) // 2
+
+        return {
+            "compatible": compatible,
+            "score": median_score,
+            "confidence": median_conf,
+            "reason": str(anchor.get("reason") or "")[:600],
+            "highlights": list(anchor.get("highlights") or [])[:5],
+            "risks": list(anchor.get("risks") or [])[:5],
+            "sampled": [
+                {
+                    "score": _safe_int(r.get("score", 0)),
+                    "confidence": _safe_int(r.get("confidence", 0)),
+                    "compatible": bool(r.get("compatible", False)),
+                }
+                for r in results
+            ],
+        }

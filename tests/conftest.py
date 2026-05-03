@@ -116,3 +116,26 @@ class FakeLLM:
         from app.services.llm_client import LLMClient
 
         return await LLMClient.chat_with_tools(self, messages, tools, tool_dispatch, **kwargs)
+
+    # Bind ReAct / Self-Consistency / agent_chat_turn helpers from real LLMClient
+    async def agent_chat_turn(self, agent_name, agent_personality, conversation_history):
+        from app.services.llm_client import LLMClient
+
+        return await LLMClient.agent_chat_turn(self, agent_name, agent_personality, conversation_history)
+
+    async def agent_chat_turn_react(self, agent_name, agent_personality, conversation_history):
+        from app.services.llm_client import LLMClient
+
+        return await LLMClient.agent_chat_turn_react(
+            self, agent_name, agent_personality, conversation_history
+        )
+
+    async def evaluate_match(self, *args, **kwargs):
+        from app.services.llm_client import LLMClient
+
+        return await LLMClient.evaluate_match(self, *args, **kwargs)
+
+    async def evaluate_match_self_consistent(self, *args, **kwargs):
+        from app.services.llm_client import LLMClient
+
+        return await LLMClient.evaluate_match_self_consistent(self, *args, **kwargs)
