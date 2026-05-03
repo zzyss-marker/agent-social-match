@@ -27,6 +27,7 @@ from app.models.models import Agent, Conversation, ConversationParticipant, Mess
 from app.schemas.common import ErrorDetail
 from app.schemas.schemas import UserRegister
 from app.services import auth_service, avatar_service, chat_service, discovery_service, simulator_service
+from app.services.agent_tools import TOOL_SCHEMAS, build_tool_dispatch
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = BASE_DIR / "templates"
@@ -316,6 +317,11 @@ def _build_chat_system_prompt(agent_name: str, personality: dict[str, Any]) -> s
         "暴力仇恨、与交友无关的空泛闲聊。\n"
         "若用户提无关问题：先简短说明你只做交友画像，再把话题拉回用户本人。\n"
         "若信息不足：明确说“我还不知道”，并只追问一个澄清问题。\n"
+        "可用工具（在合适时机主动调用，不要硬聊）：\n"
+        "  - search_similar_users(keyword): 当用户问'有没有像我一样喜欢XX的人'时调用。\n"
+        "  - get_my_recommendations(status): 当用户问'我的推荐怎么样了'时调用。\n"
+        "  - update_my_boundary(item): 当用户明确说'我不接受X'/'我不想要XX'时调用。\n"
+        "工具返回的结果要用自然语言总结给用户，不要直接贴 JSON。\n"
         "回复要求：中文口语、1到2句、每次不超过60字，避免说教和模板腔。"
     )
 
@@ -1158,10 +1164,18 @@ def create_app() -> FastAPI:
                 agent_reply = fallback_reply
             else:
                 try:
-                    agent_reply = await llm.chat(
+                    # Tool Use：让 Agent 能主动调用 search_similar_users 等工具
+                    tool_dispatch = build_tool_dispatch(
+                        session=session,
+                        current_user_id=user_id,
+                    )
+                    agent_reply = await llm.chat_with_tools(
                         [system_prompt] + llm_messages,
+                        tools=TOOL_SCHEMAS,
+                        tool_dispatch=tool_dispatch,
+                        max_rounds=3,
                         temperature=0.25,
-                        max_tokens=220,
+                        max_tokens=320,
                     )
                 except Exception as exc:
                     logger.warning(

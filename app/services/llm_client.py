@@ -52,6 +52,137 @@ class LLMClient:
 
         return self._extract_message_text(response.json())
 
+    async def chat_raw(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+        """与 chat 类似，但返回完整的 choice0.message 字典（用于 tool_calls）。
+
+        额外支持 kwargs:
+            tools: list  -> OpenAI 标准 tools 字段
+            tool_choice: str|dict -> 默认 "auto"
+        """
+        connect_timeout = float(kwargs.pop("connect_timeout_seconds", 20.0))
+        read_timeout = float(kwargs.pop("timeout_seconds", 60.0))
+        tools = kwargs.pop("tools", None)
+        tool_choice = kwargs.pop("tool_choice", None)
+
+        payload: dict[str, Any] = {
+            "model": kwargs.get("model", self.model),
+            "messages": messages,
+            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+            "temperature": kwargs.get("temperature", self.temperature),
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice or "auto"
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(read_timeout, connect=connect_timeout)) as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self._headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:300]
+            raise RuntimeError(f"LLM request failed: HTTP {exc.response.status_code}. {detail}") from exc
+        except httpx.HTTPError as exc:
+            exc_name = exc.__class__.__name__
+            exc_text = str(exc).strip()
+            if not exc_text:
+                exc_text = repr(exc)
+            raise RuntimeError(f"LLM request failed: {exc_name}. {exc_text}") from exc
+
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            raise RuntimeError("LLM response missing choices.")
+        message = choices[0].get("message") or {}
+        if not isinstance(message, dict):
+            raise RuntimeError("LLM response message invalid.")
+        return message
+
+    async def chat_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_dispatch: dict[str, Any],
+        *,
+        max_rounds: int = 3,
+        **kwargs: Any,
+    ) -> str:
+        """支持 tool_calls 循环的对话。
+
+        - 调用模型；如果模型返回 tool_calls，则执行对应 Python 协程，把结果以 tool role 追加，再次调用模型。
+        - 最多循环 max_rounds 次，避免死循环。
+        - 最终返回模型的纯文本回复。
+        """
+        from app.services.agent_tools import safe_parse_arguments
+
+        history = list(messages)
+        last_text = ""
+
+        for _round in range(max(1, max_rounds)):
+            message = await self.chat_raw(history, tools=tools, **kwargs)
+            tool_calls = message.get("tool_calls")
+            content = message.get("content")
+            if isinstance(content, list):
+                # multimodal-like content collapse to text
+                texts = []
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        texts.append(part["text"])
+                content_text = "".join(texts).strip()
+            elif isinstance(content, str):
+                content_text = content.strip()
+            else:
+                content_text = ""
+
+            if not tool_calls:
+                return content_text
+
+            # 1) 把 assistant 的 tool_calls 消息加入 history
+            assistant_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": content_text or None,
+                "tool_calls": tool_calls,
+            }
+            history.append(assistant_msg)
+
+            # 2) 执行每个 tool_call
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                call_id = call.get("id") or "unknown"
+                fn = call.get("function") or {}
+                name = str(fn.get("name") or "")
+                args = safe_parse_arguments(fn.get("arguments"))
+
+                handler = tool_dispatch.get(name)
+                if handler is None:
+                    tool_result: dict[str, Any] = {"error": f"未知工具：{name}"}
+                else:
+                    try:
+                        tool_result = await handler(args)
+                    except Exception as exc:
+                        tool_result = {"error": f"{name} 执行异常：{str(exc)[:160]}"}
+
+                history.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps(tool_result, ensure_ascii=False),
+                    }
+                )
+            last_text = content_text
+
+        # 超过 max_rounds 还没产出最终文本，做一次兜底纯文本调用
+        if last_text:
+            return last_text
+        try:
+            return await self.chat(history, **kwargs)
+        except Exception:
+            return last_text or "（工具调用循环结束，但未产出文本回复）"
+
     def _extract_message_text(self, data: dict[str, Any]) -> str:
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
