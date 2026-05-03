@@ -91,6 +91,8 @@ class Recommendation(Base, TimestampMixin):
     to_agent_id: Mapped[int] = mapped_column(Integer, ForeignKey("agents.id"), nullable=False)
     score: Mapped[int] = mapped_column(Integer, nullable=False)  # 0-100
     reason: Mapped[str] = mapped_column(Text, nullable=False)
+    highlights: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    risks: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     agent_conversation_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("conversations.id"), nullable=True)
     from_approved: Mapped[bool] = mapped_column(Boolean, default=False)
     to_approved: Mapped[bool] = mapped_column(Boolean, default=False)

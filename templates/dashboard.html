@@ -237,6 +237,22 @@
           </div>
           <p class="rec-reason">{{ rec.reason }}</p>
           <p class="rec-pair">{{ rec.from_agent_name }} -> {{ rec.to_agent_name }}</p>
+          {% if rec.highlights %}
+          <div class="rec-tags rec-highlights">
+            <span class="rec-tag-label">亮点</span>
+            {% for h in rec.highlights %}
+            <span class="chip chip-positive">{{ h }}</span>
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if rec.risks %}
+          <div class="rec-tags rec-risks">
+            <span class="rec-tag-label">风险</span>
+            {% for r in rec.risks %}
+            <span class="chip chip-warning">{{ r }}</span>
+            {% endfor %}
+          </div>
+          {% endif %}
           {% if rec.status not in ("mutual", "rejected") %}
           <div class="actions">
             <form action="/rec/{{ rec.id }}/approve" method="post">

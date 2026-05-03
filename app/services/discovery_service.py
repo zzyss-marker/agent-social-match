@@ -408,6 +408,8 @@ async def _agent_chat_and_evaluate(
             to_agent_id=agent_b.id,
             score=score,
             reason=reason,
+            highlights=list(evaluation.get("highlights") or [])[:5],
+            risks=list(evaluation.get("risks") or [])[:8],
             agent_conversation_id=conv.id,
             status="pending",
         )

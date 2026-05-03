@@ -183,6 +183,13 @@ def _apply_startup_schema_patches(sync_conn) -> None:
             )
         )
 
+    if "recommendations" in table_names:
+        rec_columns = {col["name"] for col in inspector.get_columns("recommendations")}
+        if "highlights" not in rec_columns:
+            sync_conn.execute(text("ALTER TABLE recommendations ADD COLUMN highlights TEXT NOT NULL DEFAULT '[]'"))
+        if "risks" not in rec_columns:
+            sync_conn.execute(text("ALTER TABLE recommendations ADD COLUMN risks TEXT NOT NULL DEFAULT '[]'"))
+
     if "email_verification_codes" not in table_names:
         sync_conn.execute(
             text(
@@ -847,6 +854,8 @@ def create_app() -> FastAPI:
                             "to_agent_name": to_agent.name if to_agent else "?",
                             "score": rec.score,
                             "reason": rec.reason,
+                            "highlights": list(rec.highlights or []),
+                            "risks": list(rec.risks or []),
                             "from_approved": rec.from_approved,
                             "to_approved": rec.to_approved,
                             "status": rec.status,
