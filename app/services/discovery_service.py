@@ -241,31 +241,61 @@ async def _agent_chat_and_evaluate(
 ) -> dict[str, int] | None:
     """
     Run an agent-agent conversation and evaluation.
+
+    本函数现在使用：
+    - ReAct（Yao et al. 2022）：每轮 Agent 输出 Thought / Observation / Action 结构化字段
+    - Self-Consistency（Wang et al. 2022）：评估多次采样取中位数
+
     Important: do LLM calls first, then persist in one short DB write window.
     """
     history: list[dict[str, str]] = []
     transcript: list[tuple[int, str]] = []
+    react_log: list[dict[str, str]] = []  # 仅日志：内部思考链
 
     starter = agent_a
     responder = agent_b
 
     for _ in range(4):
-        starter_msg = await llm.agent_chat_turn(starter.name, starter.personality, history)
+        starter_react = await llm.agent_chat_turn_react(starter.name, starter.personality, history)
+        starter_msg = starter_react.get("action") or ""
+        if not starter_msg:
+            # 降级到非 ReAct 调用避免空消息
+            starter_msg = await llm.agent_chat_turn(starter.name, starter.personality, history)
         history.append({"role": "user", "content": f"{starter.name}: {starter_msg}"})
         transcript.append((starter.id, starter_msg))
+        react_log.append(
+            {
+                "speaker": starter.name,
+                "thought": starter_react.get("thought", ""),
+                "observation": starter_react.get("observation", ""),
+                "action": starter_msg,
+            }
+        )
 
-        responder_msg = await llm.agent_chat_turn(responder.name, responder.personality, history)
+        responder_react = await llm.agent_chat_turn_react(responder.name, responder.personality, history)
+        responder_msg = responder_react.get("action") or ""
+        if not responder_msg:
+            responder_msg = await llm.agent_chat_turn(responder.name, responder.personality, history)
         history.append({"role": "user", "content": f"{responder.name}: {responder_msg}"})
         transcript.append((responder.id, responder_msg))
+        react_log.append(
+            {
+                "speaker": responder.name,
+                "thought": responder_react.get("thought", ""),
+                "observation": responder_react.get("observation", ""),
+                "action": responder_msg,
+            }
+        )
 
         starter, responder = responder, starter
 
-    evaluation = await llm.evaluate_match(
+    evaluation = await llm.evaluate_match_self_consistent(
         agent_a.name,
         agent_a.personality,
         agent_b.name,
         agent_b.personality,
         history,
+        samples=3,
     )
     compatible = bool(evaluation.get("compatible", False))
     raw_score = int(evaluation.get("score", 0) or 0)
@@ -313,7 +343,13 @@ async def _agent_chat_and_evaluate(
         )
         session.add(rec)
         await session.flush()
-        return {"score": score, "confidence": confidence, "recommendation_id": rec.id}
+        return {
+            "score": score,
+            "confidence": confidence,
+            "recommendation_id": rec.id,
+            "react_turns": len(react_log),
+            "samples": len(evaluation.get("sampled", []) or []),
+        }
 
     await session.flush()
     return None
