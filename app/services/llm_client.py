@@ -450,3 +450,81 @@ class LLMClient:
                 for r in results
             ],
         }
+
+    async def judge_recommendation(
+        self,
+        agent_a_name: str,
+        agent_a_profile: dict[str, Any],
+        agent_b_name: str,
+        agent_b_profile: dict[str, Any],
+        conversation_transcript: list[dict[str, Any]],
+        primary_evaluation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """JudgeAgent：独立第三方仲裁。
+
+        多 Agent 协作思路对应 CAMEL（Li et al. 2023）/ AutoGen（Wu et al. 2023）：
+        在原始评估之外引入一个职责单一的"风险审查 Agent"，它只看：
+            - 是否有边界冲突（boundaries 中明确的不接受项）
+            - 是否对话越界（涉及政治/医疗/投资/暴力等违规话题）
+            - 是否存在数据脆弱（双方资料过空、对话太短等）
+
+        返回 JSON：
+            {
+              "judge_pass": bool,    # 是否放行（false 表示 veto）
+              "veto_reason": str,    # 若 veto 给出原因
+              "additional_risks": [...],     # 补充给主评估的额外风险
+              "score_adjustment": int        # [-30, 0]，最多减 30 分
+            }
+        """
+        system = {
+            "role": "system",
+            "content": (
+                "你是社交匹配的独立风险仲裁 Agent。你不参与对话，只做事后审查。\n"
+                "你的任务：检查这条推荐是否存在以下问题，必要时投否决票（veto）。\n"
+                "1. 边界冲突：任何一方 boundaries 中明确禁止的项，对方却命中了。\n"
+                "2. 对话越界：转录中是否触及政治、医疗、投资、暴力、成人内容等。\n"
+                "3. 证据不足：对话过短或资料过于稀疏，主评估的高分缺乏依据。\n"
+                "请严格、保守、可解释。仅返回 JSON：\n"
+                '{"judge_pass":true/false,"veto_reason":"<原因，不超过60字>",'
+                '"additional_risks":["<额外风险1>","<额外风险2>"],'
+                '"score_adjustment":<-30到0的整数，正常情况为0>}'
+            ),
+        }
+        context = (
+            f"{agent_a_name} 资料：{agent_a_profile}\n"
+            f"{agent_b_name} 资料：{agent_b_profile}\n"
+            f"主评估：{primary_evaluation}\n"
+            "以下是双方 Agent 对话："
+        )
+        messages = [system, {"role": "user", "content": context}] + conversation_transcript
+        try:
+            data = await self.chat_json(messages, temperature=0.05, max_tokens=260)
+        except Exception:
+            return {
+                "judge_pass": True,
+                "veto_reason": "",
+                "additional_risks": ["judge_agent_unavailable"],
+                "score_adjustment": 0,
+            }
+
+        if not isinstance(data, dict) or "raw" in data:
+            return {
+                "judge_pass": True,
+                "veto_reason": "",
+                "additional_risks": ["judge_response_unparsed"],
+                "score_adjustment": 0,
+            }
+
+        adjustment_raw = data.get("score_adjustment", 0)
+        try:
+            adjustment = int(adjustment_raw)
+        except Exception:
+            adjustment = 0
+        adjustment = max(-30, min(0, adjustment))
+
+        return {
+            "judge_pass": bool(data.get("judge_pass", True)),
+            "veto_reason": str(data.get("veto_reason") or "")[:200],
+            "additional_risks": [str(x) for x in (data.get("additional_risks") or [])][:5],
+            "score_adjustment": adjustment,
+        }

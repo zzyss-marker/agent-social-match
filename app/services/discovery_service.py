@@ -350,6 +350,29 @@ async def _agent_chat_and_evaluate(
     score = _calibrate_score(raw_score, confidence)
     reason = str(evaluation.get("reason", "") or "双方在对话中发现了有限共同点")
 
+    # 第三方仲裁（JudgeAgent）：独立审查边界冲突 / 越界 / 证据不足
+    judge = await llm.judge_recommendation(
+        agent_a.name,
+        agent_a.personality,
+        agent_b.name,
+        agent_b.personality,
+        history,
+        primary_evaluation=evaluation,
+    )
+    judge_pass = bool(judge.get("judge_pass", True))
+    additional_risks = [str(r) for r in (judge.get("additional_risks") or []) if str(r).strip()]
+    score_adjustment = int(judge.get("score_adjustment", 0) or 0)
+    if score_adjustment:
+        score = max(0, min(100, score + score_adjustment))
+
+    # 把额外风险并进 evaluation.risks，便于下游展示
+    merged_risks = list(evaluation.get("risks") or []) + additional_risks
+    evaluation = {
+        **evaluation,
+        "risks": merged_risks,
+        "judge": judge,
+    }
+
     conv = Conversation(conv_type="agent_agent")
     session.add(conv)
     await session.flush()
@@ -379,7 +402,7 @@ async def _agent_chat_and_evaluate(
             )
         )
 
-    if compatible and score >= min_match_score and confidence >= min_confidence:
+    if compatible and judge_pass and score >= min_match_score and confidence >= min_confidence:
         rec = Recommendation(
             from_agent_id=agent_a.id,
             to_agent_id=agent_b.id,
@@ -396,6 +419,8 @@ async def _agent_chat_and_evaluate(
             "recommendation_id": rec.id,
             "react_turns": len(react_log),
             "samples": len(evaluation.get("sampled", []) or []),
+            "judge_pass": judge_pass,
+            "score_adjustment": score_adjustment,
         }
 
     await session.flush()
