@@ -139,3 +139,8 @@ class FakeLLM:
         from app.services.llm_client import LLMClient
 
         return await LLMClient.evaluate_match_self_consistent(self, *args, **kwargs)
+
+    async def judge_recommendation(self, *args, **kwargs):
+        from app.services.llm_client import LLMClient
+
+        return await LLMClient.judge_recommendation(self, *args, **kwargs)
