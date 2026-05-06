@@ -8,6 +8,39 @@ import httpx
 from app.core.config import Settings
 
 
+def _summarize_tool_result(name: str, result: dict[str, Any]) -> str:
+    """把工具返回结果浓缩成一句给前端 chip 显示的简短描述。"""
+    if not isinstance(result, dict):
+        return f"{name} 执行完成"
+    if "error" in result:
+        return f"失败：{str(result['error'])[:60]}"
+
+    if name == "search_similar_users":
+        cnt = int(result.get("match_count", 0) or 0)
+        keyword = str(result.get("keyword") or "").strip()
+        list_mode = bool(result.get("list_mode"))
+        if list_mode:
+            return f"列出社区 Agent，共找到 {cnt} 个" if cnt else "社区里暂无其他 Agent"
+        if cnt == 0:
+            return f"按 '{keyword}' 搜索，无匹配"
+        names = ", ".join(str(m.get("name", "")) for m in (result.get("matches") or [])[:3])
+        more = "" if cnt <= 3 else " 等"
+        return f"按 '{keyword}' 搜索到 {cnt} 个：{names}{more}"
+
+    if name == "get_my_recommendations":
+        cnt = int(result.get("count", 0) or 0)
+        status = str(result.get("status") or "all")
+        return f"查询到 {cnt} 条 {status} 推荐"
+
+    if name == "update_my_boundary":
+        if result.get("ok"):
+            bds = result.get("boundaries") or []
+            return f"已更新边界，共 {len(bds)} 项"
+        return f"更新失败：{str(result.get('message') or '未知原因')[:60]}"
+
+    return f"{name} 执行完成"
+
+
 class LLMClient:
     def __init__(self, settings: Settings) -> None:
         self.base_url = settings.LLM_BASE_URL.rstrip("/")
@@ -110,23 +143,39 @@ class LLMClient:
         max_rounds: int = 3,
         **kwargs: Any,
     ) -> str:
-        """支持 tool_calls 循环的对话。
+        """兼容旧接口：仅返回最终文本。"""
+        text, _ = await self.chat_with_tools_traced(
+            messages, tools, tool_dispatch, max_rounds=max_rounds, **kwargs
+        )
+        return text
+
+    async def chat_with_tools_traced(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_dispatch: dict[str, Any],
+        *,
+        max_rounds: int = 3,
+        **kwargs: Any,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """支持 tool_calls 循环的对话，并返回 (最终文本, 工具调用轨迹)。
 
         - 调用模型；如果模型返回 tool_calls，则执行对应 Python 协程，把结果以 tool role 追加，再次调用模型。
         - 最多循环 max_rounds 次，避免死循环。
-        - 最终返回模型的纯文本回复。
+        - 工具调用轨迹格式：[{"name": "...", "arguments": {...}, "summary": "...", "ok": True}]
+          summary 是基于 result 提炼的简短描述，便于前端渲染。
         """
         from app.services.agent_tools import safe_parse_arguments
 
         history = list(messages)
         last_text = ""
+        traces: list[dict[str, Any]] = []
 
         for _round in range(max(1, max_rounds)):
             message = await self.chat_raw(history, tools=tools, **kwargs)
             tool_calls = message.get("tool_calls")
             content = message.get("content")
             if isinstance(content, list):
-                # multimodal-like content collapse to text
                 texts = []
                 for part in content:
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
@@ -138,7 +187,7 @@ class LLMClient:
                 content_text = ""
 
             if not tool_calls:
-                return content_text
+                return content_text, traces
 
             # 1) 把 assistant 的 tool_calls 消息加入 history
             assistant_msg: dict[str, Any] = {
@@ -160,11 +209,23 @@ class LLMClient:
                 handler = tool_dispatch.get(name)
                 if handler is None:
                     tool_result: dict[str, Any] = {"error": f"未知工具：{name}"}
+                    ok = False
                 else:
                     try:
                         tool_result = await handler(args)
+                        ok = "error" not in tool_result
                     except Exception as exc:
                         tool_result = {"error": f"{name} 执行异常：{str(exc)[:160]}"}
+                        ok = False
+
+                traces.append(
+                    {
+                        "name": name,
+                        "arguments": args,
+                        "summary": _summarize_tool_result(name, tool_result),
+                        "ok": ok,
+                    }
+                )
 
                 history.append(
                     {
@@ -175,13 +236,14 @@ class LLMClient:
                 )
             last_text = content_text
 
-        # 超过 max_rounds 还没产出最终文本，做一次兜底纯文本调用
+        # 超过 max_rounds 还没产出最终文本，兜底
         if last_text:
-            return last_text
+            return last_text, traces
         try:
-            return await self.chat(history, **kwargs)
+            text = await self.chat(history, **kwargs)
+            return text, traces
         except Exception:
-            return last_text or "（工具调用循环结束，但未产出文本回复）"
+            return last_text or "（工具调用循环结束，但未产出文本回复）", traces
 
     def _extract_message_text(self, data: dict[str, Any]) -> str:
         choices = data.get("choices")

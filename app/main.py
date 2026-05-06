@@ -318,18 +318,26 @@ def _build_chat_system_prompt(agent_name: str, personality: dict[str, Any]) -> s
         f"长期上下文记忆：{context_memory if context_memory else '暂无'}。\n"
         f"用户边界偏好：{boundaries if boundaries else '暂无'}。\n"
         f"沟通偏好：{profile['conversation_style'] or '自然、具体、少废话'}。\n"
-        "核心目标：只围绕“了解用户并用于交友匹配”展开对话。\n"
+        "\n=== 工具使用（最高优先级，必须先判断要不要调） ===\n"
+        "你有 3 个可调用的工具，遇到以下情况必须主动调用，不要拒答也不要假装查不到：\n"
+        "  - search_similar_users(keyword): 用户想了解社区里其他用户/Agent 时调用。\n"
+        "    触发例子：'社区里都有谁'、'有没有像我一样喜欢XX的人'、'还有什么 Agent'、\n"
+        "    '系统里有哪些 agent'、'帮我看看其他用户'、'谁喜欢动漫'、'有谁'、'介绍下别的 agent'。\n"
+        "    keyword 是搜索关键词；用户问'有谁/有哪些'但没说具体兴趣时，keyword 传空字符串。\n"
+        "  - get_my_recommendations(status): 用户问自己的推荐情况时调用。\n"
+        "    触发例子：'我的推荐怎么样了'、'有人推荐我了吗'、'我有什么待处理的'。\n"
+        "  - update_my_boundary(item): 用户明确表达不接受某事时调用。\n"
+        "    触发例子：'我不接受异地'、'我不想要吸烟的'、'不喜欢XX的伴侣'。\n"
+        "工具返回结果后用自然中文总结给用户，不要直接贴 JSON。\n"
+        "如果工具返回 0 条结果，要明说'社区里目前没有匹配的'，不要敷衍。\n"
+        "\n=== 对话规则（仅在不需要调工具时适用） ===\n"
+        "核心目标：了解用户并用于交友匹配。\n"
         "允许话题：兴趣、生活方式、价值观、关系期待、社交边界、沟通偏好、近期状态。\n"
-        "严格禁止：编造用户经历/身份信息；讨论政治时事、投资理财、医疗法律建议、成人露骨内容、"
-        "暴力仇恨、与交友无关的空泛闲聊。\n"
-        "若用户提无关问题：先简短说明你只做交友画像，再把话题拉回用户本人。\n"
-        "若信息不足：明确说“我还不知道”，并只追问一个澄清问题。\n"
-        "可用工具（在合适时机主动调用，不要硬聊）：\n"
-        "  - search_similar_users(keyword): 当用户问'有没有像我一样喜欢XX的人'时调用。\n"
-        "  - get_my_recommendations(status): 当用户问'我的推荐怎么样了'时调用。\n"
-        "  - update_my_boundary(item): 当用户明确说'我不接受X'/'我不想要XX'时调用。\n"
-        "工具返回的结果要用自然语言总结给用户，不要直接贴 JSON。\n"
-        "回复要求：中文口语、1到2句、每次不超过60字，避免说教和模板腔。"
+        "禁止：编造用户经历/身份信息、政治时事、投资理财、医疗法律、成人露骨、暴力仇恨。\n"
+        "无关问题（如政治、投资）：简短说明你只做交友画像，再拉回用户本人。\n"
+        "信息不足：明确说'我还不知道'，并只追问一个澄清问题。\n"
+        "\n=== 回复格式 ===\n"
+        "中文口语、1到2句、每次不超过60字，避免说教和模板腔。"
     )
 
 
@@ -1169,6 +1177,7 @@ def create_app() -> FastAPI:
             }
             fallback_reply = "我收到了你的消息，但模型服务暂时不可用。你可以继续说，我会尽快恢复。"
 
+            tool_traces: list[dict[str, Any]] = []
             if llm is None:
                 agent_reply = fallback_reply
             else:
@@ -1178,7 +1187,7 @@ def create_app() -> FastAPI:
                         session=session,
                         current_user_id=user_id,
                     )
-                    agent_reply = await llm.chat_with_tools(
+                    agent_reply, tool_traces = await llm.chat_with_tools_traced(
                         [system_prompt] + llm_messages,
                         tools=TOOL_SCHEMAS,
                         tool_dispatch=tool_dispatch,
@@ -1197,6 +1206,14 @@ def create_app() -> FastAPI:
                     agent_reply = fallback_reply
 
             agent_msg = await chat_service.send_message(session, conv.id, "agent", agent_resp.id, agent_reply)
+            if tool_traces:
+                logger.info(
+                    "chat_tool_used",
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    conversation_id=conv.id,
+                    tools=[t.get("name") for t in tool_traces],
+                )
 
             # 每 3 条用户消息增量整理一次画像和上下文记忆。
             user_turns = sum(1 for m in recent_messages if m.sender_role == "user")
@@ -1238,6 +1255,7 @@ def create_app() -> FastAPI:
                         "content": agent_msg.content,
                         "created_at": format_utc8(agent_msg.created_at),
                     },
+                    "tool_traces": tool_traces,
                 },
             )
         return RedirectResponse(url=f"/chat/{agent_id}", status_code=303)

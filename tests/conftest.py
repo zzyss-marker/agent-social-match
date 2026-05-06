@@ -117,6 +117,11 @@ class FakeLLM:
 
         return await LLMClient.chat_with_tools(self, messages, tools, tool_dispatch, **kwargs)
 
+    async def chat_with_tools_traced(self, messages, tools, tool_dispatch, **kwargs):
+        from app.services.llm_client import LLMClient
+
+        return await LLMClient.chat_with_tools_traced(self, messages, tools, tool_dispatch, **kwargs)
+
     # Bind ReAct / Self-Consistency / agent_chat_turn helpers from real LLMClient
     async def agent_chat_turn(self, agent_name, agent_personality, conversation_history):
         from app.services.llm_client import LLMClient

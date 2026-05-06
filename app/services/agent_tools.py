@@ -25,10 +25,11 @@ async def search_similar_users(
 ) -> dict[str, Any]:
     """按关键字搜索社区里其他 Agent。
     匹配 Agent.name 或 personality 的 traits/interests/looking_for/vibe 文本。
+
+    keyword 为空字符串时，列出社区里任意 N 个 Agent（用户问'有谁/有哪些'时）。
     """
     keyword_clean = (keyword or "").strip().lower()
-    if not keyword_clean:
-        return {"keyword": keyword, "match_count": 0, "matches": [], "note": "关键字为空，未执行搜索"}
+    list_mode = not keyword_clean  # 空关键字 = 列表模式
 
     # 取 current_user 的 agent.id 排除自己
     my_agent_id = (
@@ -45,6 +46,7 @@ async def search_similar_users(
         )
     ).scalars().all()
 
+    cap = max(1, min(limit, 20))
     matches: list[dict[str, Any]] = []
     for ag in rows:
         haystack_parts: list[str] = [str(ag.name or "")]
@@ -57,7 +59,8 @@ async def search_similar_users(
                 elif isinstance(value, str):
                     haystack_parts.append(value)
         haystack = " ".join(haystack_parts).lower()
-        if keyword_clean in haystack:
+
+        if list_mode or keyword_clean in haystack:
             matches.append(
                 {
                     "agent_id": ag.id,
@@ -66,11 +69,12 @@ async def search_similar_users(
                     "vibe": (p.get("vibe") if isinstance(p, dict) else "") or "",
                 }
             )
-        if len(matches) >= max(1, min(limit, 20)):
+        if len(matches) >= cap:
             break
 
     return {
         "keyword": keyword,
+        "list_mode": list_mode,
         "match_count": len(matches),
         "matches": matches,
     }
@@ -163,11 +167,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_similar_users",
-            "description": "按关键字搜索社区里其他 Agent（匹配名字/兴趣/特征/looking_for/vibe）。当用户问'有没有像我一样喜欢XXX的人'时调用。",
+            "description": (
+                "搜索/列出社区里其他 Agent。"
+                "用户问'有没有像我一样喜欢XX的人'/'谁喜欢XX'时，keyword 填该兴趣词；"
+                "用户问'社区里都有谁'/'有哪些 Agent'/'介绍下别的'/'有谁'时，keyword 填空字符串以列出任意 Agent。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keyword": {"type": "string", "description": "搜索关键字，例如 '动漫'、'健身'、'读书'"},
+                    "keyword": {
+                        "type": "string",
+                        "description": "搜索关键字（兴趣/特征词），列表模式下传空字符串 ''",
+                    },
                     "limit": {"type": "integer", "description": "最多返回多少条，默认 5", "default": 5},
                 },
                 "required": ["keyword"],
