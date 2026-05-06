@@ -272,16 +272,38 @@ def _unique_keep_order(items: list[str]) -> list[str]:
     return out
 
 
+# 画像各字段的容量上限（更小的 cap + LRU 机制 = 旧条目自然被新条目挤出）
+_PROFILE_CAPS = {
+    "traits": 10,
+    "interests": 10,
+    "context_memory": 12,
+    "boundaries": 10,
+}
+
+
+def _lru_merge(old_items: list[str], new_items: list[str], cap: int) -> list[str]:
+    """LRU 式合并：新提到的条目放最前，旧条目往后挤。
+
+    场景：用户上一轮说喜欢运动，三个月后改说喜欢读书。
+    旧 _unique_keep_order(old + new) 会把"运动"留在前面、"读书"挤到后面（cap 截断也保留前面），
+    导致用户兴趣"无法被替换"。
+    现在 _unique_keep_order(new + old)[:cap]：新提到的优先，旧的若超过 cap 就被丢掉。
+    """
+    return _unique_keep_order(new_items + old_items)[:cap]
+
+
 def _merge_profile(old_profile: Any, new_profile: Any) -> dict[str, Any]:
     old_norm = _normalize_profile(old_profile)
     new_norm = _normalize_profile(new_profile)
 
-    traits = _unique_keep_order(old_norm["traits"] + new_norm["traits"])[:20]
-    interests = _unique_keep_order(old_norm["interests"] + new_norm["interests"])[:20]
+    traits = _lru_merge(old_norm["traits"], new_norm["traits"], _PROFILE_CAPS["traits"])
+    interests = _lru_merge(old_norm["interests"], new_norm["interests"], _PROFILE_CAPS["interests"])
     looking_for = new_norm["looking_for"] or old_norm["looking_for"]
     vibe = new_norm["vibe"] or old_norm["vibe"] or "自然友好"
-    context_memory = _unique_keep_order(old_norm["context_memory"] + new_norm["context_memory"])[:30]
-    boundaries = _unique_keep_order(old_norm["boundaries"] + new_norm["boundaries"])[:20]
+    context_memory = _lru_merge(
+        old_norm["context_memory"], new_norm["context_memory"], _PROFILE_CAPS["context_memory"]
+    )
+    boundaries = _lru_merge(old_norm["boundaries"], new_norm["boundaries"], _PROFILE_CAPS["boundaries"])
     conversation_style = new_norm["conversation_style"] or old_norm["conversation_style"]
 
     snapshots = old_norm["snapshots"] + [
@@ -319,15 +341,20 @@ def _build_chat_system_prompt(agent_name: str, personality: dict[str, Any]) -> s
         f"用户边界偏好：{boundaries if boundaries else '暂无'}。\n"
         f"沟通偏好：{profile['conversation_style'] or '自然、具体、少废话'}。\n"
         "\n=== 工具使用（最高优先级，必须先判断要不要调） ===\n"
-        "你有 3 个可调用的工具，遇到以下情况必须主动调用，不要拒答也不要假装查不到：\n"
+        "你有 6 个可调用的工具，遇到以下情况必须主动调用，不要拒答也不要假装查不到。\n"
+        "**同一工具同一参数在一次回复里只调用一次，不要重复调。**\n"
         "  - search_similar_users(keyword): 用户想了解社区里其他用户/Agent 时调用。\n"
         "    触发例子：'社区里都有谁'、'有没有像我一样喜欢XX的人'、'还有什么 Agent'、\n"
-        "    '系统里有哪些 agent'、'帮我看看其他用户'、'谁喜欢动漫'、'有谁'、'介绍下别的 agent'。\n"
-        "    keyword 是搜索关键词；用户问'有谁/有哪些'但没说具体兴趣时，keyword 传空字符串。\n"
+        "    '系统里有哪些 agent'、'帮我看看其他用户'、'谁喜欢动漫'、'有谁'。\n"
+        "    keyword 是搜索关键词；问'有谁'但没说具体兴趣时，keyword 传空字符串。\n"
         "  - get_my_recommendations(status): 用户问自己的推荐情况时调用。\n"
-        "    触发例子：'我的推荐怎么样了'、'有人推荐我了吗'、'我有什么待处理的'。\n"
+        "    触发例子：'我的推荐怎么样了'、'有人推荐我了吗'。\n"
         "  - update_my_boundary(item): 用户明确表达不接受某事时调用。\n"
-        "    触发例子：'我不接受异地'、'我不想要吸烟的'、'不喜欢XX的伴侣'。\n"
+        "    触发例子：'我不接受异地'、'我不想要吸烟的'。\n"
+        "  - forget_memory(item, field?): 用户想让你忘记某条画像内容时调用。\n"
+        "    触发例子：'我不再喜欢XX'、'忘掉之前的XX'、'删掉那条'。\n"
+        "  - get_my_profile(): 用户问'你了解我多少'/'我的画像是什么'/'你记住我什么'时调用。\n"
+        "  - get_community_stats(): 用户问'社区多少人'/'最近活跃情况'时调用。\n"
         "工具返回结果后用自然中文总结给用户，不要直接贴 JSON。\n"
         "如果工具返回 0 条结果，要明说'社区里目前没有匹配的'，不要敷衍。\n"
         "\n=== 对话规则（仅在不需要调工具时适用） ===\n"
@@ -1257,6 +1284,39 @@ def create_app() -> FastAPI:
                     },
                     "tool_traces": tool_traces,
                 },
+            )
+        return RedirectResponse(url=f"/chat/{agent_id}", status_code=303)
+
+    @app.post("/chat/{agent_id}/clear")
+    async def chat_clear(request: Request, agent_id: int):
+        """清空当前用户与该 Agent 的聊天历史。"""
+        user_id = request.session.get("user_id")
+        accept_header = request.headers.get("accept", "").lower()
+        wants_json = (
+            request.headers.get("x-requested-with", "").lower() == "xmlhttprequest"
+            or "application/json" in accept_header
+        )
+        if user_id is None:
+            if wants_json:
+                return JSONResponse(status_code=401, content={"ok": False, "message": "未登录"})
+            return RedirectResponse(url="/", status_code=303)
+
+        session_factory = request.app.state.session_factory
+        async with session_factory() as session:
+            agent_resp = await auth_service.get_agent(session, agent_id)
+            if agent_resp is None or agent_resp.user_id != user_id:
+                raise HTTPException(status_code=404, detail="Agent不存在")
+
+            conv = await chat_service.get_or_create_user_agent_conv(session, user_id)
+            deleted = await session.execute(
+                Message.__table__.delete().where(Message.conversation_id == conv.id)
+            )
+            await session.commit()
+
+        if wants_json:
+            return JSONResponse(
+                status_code=200,
+                content={"ok": True, "deleted_count": int(deleted.rowcount or 0)},
             )
         return RedirectResponse(url=f"/chat/{agent_id}", status_code=303)
 
