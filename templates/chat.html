@@ -94,6 +94,35 @@
       return article;
     }
 
+    function appendToolTraces(traces) {
+      if (!messages || !traces || !traces.length) return;
+      var wrap = document.createElement('article');
+      wrap.className = 'msg msg-tool';
+      var label = document.createElement('div');
+      label.className = 'tool-label';
+      label.textContent = '🔧 Agent 调用了工具：';
+      wrap.appendChild(label);
+      traces.forEach(function (t) {
+        var chip = document.createElement('div');
+        chip.className = 'tool-chip ' + (t.ok ? 'tool-chip-ok' : 'tool-chip-fail');
+        var name = document.createElement('strong');
+        name.textContent = t.name;
+        var summary = document.createElement('span');
+        summary.textContent = ' — ' + (t.summary || '');
+        chip.appendChild(name);
+        chip.appendChild(summary);
+        if (t.arguments && Object.keys(t.arguments).length) {
+          var args = document.createElement('code');
+          args.className = 'tool-args';
+          args.textContent = JSON.stringify(t.arguments);
+          chip.appendChild(args);
+        }
+        wrap.appendChild(chip);
+      });
+      messages.appendChild(wrap);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
     form.addEventListener('submit', function (event) {
       event.preventDefault();
       if (isSending) return;
@@ -135,6 +164,10 @@
         if (pendingUser && result.data.user_message && result.data.user_message.created_at) {
           var t = pendingUser.querySelector('.msg-time');
           if (t) t.textContent = result.data.user_message.created_at;
+        }
+
+        if (result.data.tool_traces && result.data.tool_traces.length) {
+          appendToolTraces(result.data.tool_traces);
         }
 
         if (result.data.agent_message && result.data.agent_message.content) {

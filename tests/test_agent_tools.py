@@ -47,12 +47,20 @@ async def test_search_similar_users_finds_by_interest(session):
 
 
 @pytest.mark.asyncio
-async def test_search_similar_users_empty_keyword(session):
+async def test_search_similar_users_empty_keyword_lists_community(session):
+    """空关键字现在表示'列表模式'：返回任意若干 Agent，方便用户问'有谁'。"""
     me, _ = await make_user_with_agent(session, username="me")
+    await make_user_with_agent(session, username="o", agent_name="木木")
+    await make_user_with_agent(session, username="b", agent_name="阿乐")
     await session.commit()
     result = await search_similar_users(session=session, current_user_id=me.id, keyword="   ")
-    assert result["match_count"] == 0
-    assert "未执行搜索" in result["note"]
+    assert result["list_mode"] is True
+    assert result["match_count"] >= 2
+    names = [m["name"] for m in result["matches"]]
+    assert "木木" in names
+    assert "阿乐" in names
+    # 不应包含自己
+    assert all(n != "Aria" for n in names)
 
 
 @pytest.mark.asyncio

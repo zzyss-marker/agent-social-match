@@ -2180,6 +2180,61 @@ details.panel[open] .panel-summary::after {
   gap: 8px;
 }
 
+.msg-tool {
+  align-self: stretch;
+  width: 100%;
+  background: rgba(99, 102, 241, 0.06);
+  border: 1px dashed rgba(99, 102, 241, 0.35);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin: 6px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.msg-tool .tool-label {
+  font-size: 12px;
+  color: #4338ca;
+  font-weight: 600;
+}
+
+.msg-tool .tool-chip {
+  background: #fff;
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.msg-tool .tool-chip strong {
+  color: #4338ca;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 12px;
+}
+
+.msg-tool .tool-chip-fail {
+  border-color: rgba(220, 38, 38, 0.35);
+  background: rgba(254, 226, 226, 0.4);
+}
+
+.msg-tool .tool-chip-fail strong {
+  color: #b91c1c;
+}
+
+.msg-tool .tool-args {
+  background: rgba(15, 23, 42, 0.06);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #475569;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
 .chat-submit {
   min-width: 112px;
   border: none;
