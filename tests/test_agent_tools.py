@@ -20,7 +20,14 @@ from tests.conftest import FakeLLM, make_user_with_agent
 @pytest.mark.asyncio
 async def test_tool_schemas_have_required_fields():
     names = {t["function"]["name"] for t in TOOL_SCHEMAS}
-    assert names == {"search_similar_users", "get_my_recommendations", "update_my_boundary"}
+    assert names == {
+        "search_similar_users",
+        "get_my_recommendations",
+        "update_my_boundary",
+        "forget_memory",
+        "get_my_profile",
+        "get_community_stats",
+    }
     for tool in TOOL_SCHEMAS:
         assert tool["type"] == "function"
         assert "name" in tool["function"]

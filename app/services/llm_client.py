@@ -38,6 +38,26 @@ def _summarize_tool_result(name: str, result: dict[str, Any]) -> str:
             return f"已更新边界，共 {len(bds)} 项"
         return f"更新失败：{str(result.get('message') or '未知原因')[:60]}"
 
+    if name == "forget_memory":
+        if result.get("ok"):
+            removed = result.get("removed") or []
+            items = ", ".join(r.get("text", "") for r in removed[:3])
+            return f"已忘记 {len(removed)} 条：{items}"
+        return f"未找到要忘记的内容：{str(result.get('message') or '')[:60]}"
+
+    if name == "get_my_profile":
+        if result.get("ok"):
+            traits = result.get("traits") or []
+            interests = result.get("interests") or []
+            return f"画像：{len(traits)} 个特征 / {len(interests)} 个兴趣"
+        return "未找到画像"
+
+    if name == "get_community_stats":
+        if result.get("ok"):
+            total = result.get("total_agents", 0)
+            return f"社区共有 {total} 个 Agent"
+        return "查询失败"
+
     return f"{name} 执行完成"
 
 
@@ -162,6 +182,9 @@ class LLMClient:
 
         - 调用模型；如果模型返回 tool_calls，则执行对应 Python 协程，把结果以 tool role 追加，再次调用模型。
         - 最多循环 max_rounds 次，避免死循环。
+        - **同一工具 + 同一参数在本次对话中只执行一次**，避免某些模型（DeepSeek 等）
+          反复重复调用同一工具。重复调用时把缓存结果作为 tool 消息回灌，
+          并附加 system 提示要求模型用现有信息回答。
         - 工具调用轨迹格式：[{"name": "...", "arguments": {...}, "summary": "...", "ok": True}]
           summary 是基于 result 提炼的简短描述，便于前端渲染。
         """
@@ -170,6 +193,9 @@ class LLMClient:
         history = list(messages)
         last_text = ""
         traces: list[dict[str, Any]] = []
+        # 缓存：(name, args_json) -> result，用于去重重复调用
+        executed_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        forced_finalization = False
 
         for _round in range(max(1, max_rounds)):
             message = await self.chat_raw(history, tools=tools, **kwargs)
@@ -197,7 +223,8 @@ class LLMClient:
             }
             history.append(assistant_msg)
 
-            # 2) 执行每个 tool_call
+            # 2) 执行每个 tool_call（带去重）
+            any_new_call = False
             for call in tool_calls:
                 if not isinstance(call, dict):
                     continue
@@ -205,27 +232,35 @@ class LLMClient:
                 fn = call.get("function") or {}
                 name = str(fn.get("name") or "")
                 args = safe_parse_arguments(fn.get("arguments"))
+                cache_key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
 
-                handler = tool_dispatch.get(name)
-                if handler is None:
-                    tool_result: dict[str, Any] = {"error": f"未知工具：{name}"}
-                    ok = False
+                if cache_key in executed_cache:
+                    # 重复调用：直接复用之前的结果，不再次执行
+                    tool_result = executed_cache[cache_key]
+                    ok = "error" not in tool_result
                 else:
-                    try:
-                        tool_result = await handler(args)
-                        ok = "error" not in tool_result
-                    except Exception as exc:
-                        tool_result = {"error": f"{name} 执行异常：{str(exc)[:160]}"}
+                    handler = tool_dispatch.get(name)
+                    if handler is None:
+                        tool_result = {"error": f"未知工具：{name}"}
                         ok = False
+                    else:
+                        try:
+                            tool_result = await handler(args)
+                            ok = "error" not in tool_result
+                        except Exception as exc:
+                            tool_result = {"error": f"{name} 执行异常：{str(exc)[:160]}"}
+                            ok = False
+                    executed_cache[cache_key] = tool_result
+                    any_new_call = True
 
-                traces.append(
-                    {
-                        "name": name,
-                        "arguments": args,
-                        "summary": _summarize_tool_result(name, tool_result),
-                        "ok": ok,
-                    }
-                )
+                    traces.append(
+                        {
+                            "name": name,
+                            "arguments": args,
+                            "summary": _summarize_tool_result(name, tool_result),
+                            "ok": ok,
+                        }
+                    )
 
                 history.append(
                     {
@@ -234,6 +269,21 @@ class LLMClient:
                         "content": json.dumps(tool_result, ensure_ascii=False),
                     }
                 )
+
+            # 3) 如果本轮所有 tool_call 都是重复调用（没产生新结果），
+            #    强制要求模型用现有 tool 结果直接回答，避免无限循环
+            if not any_new_call and not forced_finalization:
+                history.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "你已经多次调用同一工具，请直接基于上面 tool 消息里的结果"
+                            "用自然中文回复用户，不要再调用工具。"
+                        ),
+                    }
+                )
+                forced_finalization = True
+
             last_text = content_text
 
         # 超过 max_rounds 还没产出最终文本，兜底

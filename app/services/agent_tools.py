@@ -160,6 +160,120 @@ async def update_my_boundary(
     return {"ok": True, "message": f"已添加边界：{item_clean}", "boundaries": profile["boundaries"]}
 
 
+async def forget_memory(
+    *,
+    session: AsyncSession,
+    current_user_id: int,
+    item: str,
+    field: str = "auto",
+) -> dict[str, Any]:
+    """让 Agent 忘记画像中的某条具体内容（解决画像无限累积问题）。
+
+    field 可选：
+      - 'auto'（默认）：在 traits/interests/context_memory/boundaries 中查找并删除
+      - 'interests' / 'traits' / 'context_memory' / 'boundaries'：仅删该字段
+    """
+    item_clean = (item or "").strip()
+    if not item_clean:
+        return {"ok": False, "message": "要忘记的内容不能为空"}
+
+    agent = (
+        await session.execute(select(Agent).where(Agent.user_id == current_user_id))
+    ).scalar_one_or_none()
+    if agent is None:
+        return {"ok": False, "message": "当前用户未绑定 Agent"}
+
+    profile = dict(agent.personality or {})
+    candidate_fields = (
+        [field]
+        if field in {"traits", "interests", "context_memory", "boundaries"}
+        else ["traits", "interests", "context_memory", "boundaries"]
+    )
+    removed: list[tuple[str, str]] = []
+    for fld in candidate_fields:
+        bucket = profile.get(fld)
+        if not isinstance(bucket, list):
+            continue
+        new_bucket = []
+        for v in bucket:
+            text = str(v).strip()
+            if text == item_clean or item_clean in text:
+                removed.append((fld, text))
+                continue
+            new_bucket.append(v)
+        profile[fld] = new_bucket
+
+    if not removed:
+        return {"ok": False, "message": f"画像里没找到包含 '{item_clean}' 的条目"}
+
+    agent.personality = profile
+    await session.flush()
+    return {
+        "ok": True,
+        "message": f"已忘记 {len(removed)} 条画像条目",
+        "removed": [{"field": f, "text": t} for f, t in removed],
+    }
+
+
+async def get_my_profile(
+    *,
+    session: AsyncSession,
+    current_user_id: int,
+) -> dict[str, Any]:
+    """返回当前用户 Agent 的画像（剥离内部 _embedding 字段）。"""
+    agent = (
+        await session.execute(select(Agent).where(Agent.user_id == current_user_id))
+    ).scalar_one_or_none()
+    if agent is None:
+        return {"ok": False, "message": "当前用户未绑定 Agent"}
+
+    profile = agent.personality or {}
+    cleaned = {k: v for k, v in profile.items() if not str(k).startswith("_")}
+    return {
+        "ok": True,
+        "agent_name": agent.name,
+        "traits": cleaned.get("traits") or [],
+        "interests": cleaned.get("interests") or [],
+        "looking_for": cleaned.get("looking_for") or "",
+        "vibe": cleaned.get("vibe") or "",
+        "boundaries": cleaned.get("boundaries") or [],
+        "context_memory_count": len(cleaned.get("context_memory") or []),
+    }
+
+
+async def get_community_stats(
+    *,
+    session: AsyncSession,
+    current_user_id: int,
+) -> dict[str, Any]:
+    """返回社区整体情况：Agent 总数、按 vibe 分布、最近新增。"""
+    from sqlalchemy import func as _f
+    from collections import Counter
+
+    total_result = await session.execute(select(_f.count(Agent.id)))
+    total = int(total_result.scalar_one() or 0)
+
+    rows = (
+        await session.execute(select(Agent).order_by(Agent.created_at.desc()).limit(50))
+    ).scalars().all()
+
+    vibes = Counter()
+    for ag in rows:
+        p = ag.personality or {}
+        if isinstance(p, dict):
+            v = str(p.get("vibe") or "").strip()
+            if v:
+                vibes[v] += 1
+
+    recent_names = [ag.name for ag in rows[:5]]
+    return {
+        "ok": True,
+        "total_agents": total,
+        "top_vibes": [{"vibe": v, "count": c} for v, c in vibes.most_common(5)],
+        "recent_5": recent_names,
+    }
+
+
 # ---------- OpenAI tools schema ----------
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -217,6 +331,52 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_memory",
+            "description": (
+                "让 Agent 忘记画像里的某条具体内容。"
+                "当用户说'我不再喜欢XX'/'忘掉之前我说过的XX'/'删掉那条'时调用。"
+                "可以删除 traits/interests/context_memory/boundaries 中的条目。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item": {"type": "string", "description": "要忘记的内容关键词"},
+                    "field": {
+                        "type": "string",
+                        "enum": ["auto", "traits", "interests", "context_memory", "boundaries"],
+                        "description": "在哪个字段查找，默认 auto 自动找",
+                        "default": "auto",
+                    },
+                },
+                "required": ["item"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_my_profile",
+            "description": (
+                "返回用户当前的画像（traits/interests/looking_for/vibe/boundaries 等）。"
+                "当用户问'你了解我多少'/'我的画像是什么'/'你记住了我什么'时调用。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_community_stats",
+            "description": (
+                "返回社区整体统计：Agent 总数、最常见 vibe 分布、最近新增的 5 个 Agent。"
+                "当用户问'社区多少人'/'最近活跃情况'/'有什么类型的人'时调用。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
@@ -251,10 +411,27 @@ def build_tool_dispatch(
             item=str(arguments.get("item", "")),
         )
 
+    async def _forget(arguments: dict[str, Any]) -> dict[str, Any]:
+        return await forget_memory(
+            session=session,
+            current_user_id=current_user_id,
+            item=str(arguments.get("item", "")),
+            field=str(arguments.get("field", "auto")),
+        )
+
+    async def _profile(arguments: dict[str, Any]) -> dict[str, Any]:
+        return await get_my_profile(session=session, current_user_id=current_user_id)
+
+    async def _stats(arguments: dict[str, Any]) -> dict[str, Any]:
+        return await get_community_stats(session=session, current_user_id=current_user_id)
+
     return {
         "search_similar_users": _search,
         "get_my_recommendations": _get_recs,
         "update_my_boundary": _update_boundary,
+        "forget_memory": _forget,
+        "get_my_profile": _profile,
+        "get_community_stats": _stats,
     }
 
 

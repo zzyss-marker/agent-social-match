@@ -14,6 +14,7 @@
       <strong>{{ agent.name }}</strong>
       <small>{{ {"idle": "在线", "discovering": "探索中", "chatting": "聊天中"}.get(agent.status, agent.status) }}</small>
     </div>
+    <button id="chatClearBtn" type="button" class="chat-clear-btn" title="清空与该 Agent 的聊天历史">清空记录</button>
   </header>
 
   <section class="chat-messages card-premium" id="chatMessages">
@@ -181,6 +182,37 @@
         submit.textContent = '发送消息';
       });
     });
+
+    var clearBtn = document.getElementById('chatClearBtn');
+    if (clearBtn) {
+      clearBtn.addEventListener('click', function () {
+        if (isSending) return;
+        if (!confirm('确认清空与该 Agent 的全部聊天历史？此操作不可撤销。')) return;
+        clearBtn.disabled = true;
+        clearBtn.textContent = '清空中...';
+        fetch('/chat/{{ agent.id }}/clear', {
+          method: 'POST',
+          headers: {
+            'Accept': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest'
+          }
+        }).then(function (res) { return res.json(); }).then(function (data) {
+          if (!data || !data.ok) throw new Error('清空失败');
+          if (messages) {
+            messages.innerHTML = '';
+            var empty = document.createElement('div');
+            empty.className = 'chat-empty';
+            empty.innerHTML = '<p>聊天记录已清空。</p><p class="hint">从这里开始新的对话。</p>';
+            messages.appendChild(empty);
+          }
+        }).catch(function () {
+          alert('清空失败，请重试');
+        }).finally(function () {
+          clearBtn.disabled = false;
+          clearBtn.textContent = '清空记录';
+        });
+      });
+    }
 
     input.addEventListener('keydown', function (event) {
       if (isSending) return;
