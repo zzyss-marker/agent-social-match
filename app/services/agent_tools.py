@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.models.models import Agent, Recommendation, User
 
 
@@ -274,6 +275,41 @@ async def get_community_stats(
     }
 
 
+async def chat_with_agent(
+    *,
+    session: AsyncSession,
+    current_user_id: int,
+    target: str,
+    llm: Any,
+    settings: Settings,
+) -> dict[str, Any]:
+    """让当前用户的 Agent 主动找指定 Agent 聊天评估。
+
+    target: 目标 Agent 的名字或包含的关键词（模糊匹配）。
+    内部走 run_directed_discovery：复用对话 / Judge / 评估链路，但 candidates 固定为命中的那一个。
+    速率：DISCOVERY_DIRECTED_DAILY_LIMIT 限制单 Agent 每日调用次数。
+    """
+    # 延迟导入避免与 discovery_service 互相 import
+    from app.services.discovery_service import run_directed_discovery
+
+    me = (
+        await session.execute(select(Agent).where(Agent.user_id == current_user_id))
+    ).scalar_one_or_none()
+    if me is None:
+        return {"ok": False, "message": "你还没有 Agent"}
+
+    if not target or not str(target).strip():
+        return {"ok": False, "message": "请告诉我要找哪位 Agent（名字或关键词）"}
+
+    return await run_directed_discovery(
+        session=session,
+        agent_id=int(me.id),
+        target_query=str(target).strip(),
+        llm=llm,
+        settings=settings,
+    )
+
+
 # ---------- OpenAI tools schema ----------
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -377,6 +413,28 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "chat_with_agent",
+            "description": (
+                "让你（当前用户的 Agent）主动找另一位指定 Agent 聊一轮，评估匹配度，"
+                "若分数足够会生成一条新的推荐。当用户说"
+                "'帮我和XX聊一下'/'去找XX聊聊'/'我想认识XX'/'帮我约一下XX' 时调用。"
+                "target 传目标 Agent 的名字或包含的关键词。每个 Agent 每天最多调用 3 次。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "目标 Agent 的名字或名字关键词（模糊匹配）",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+    },
 ]
 
 
@@ -386,8 +444,14 @@ ToolHandler = Callable[..., Awaitable[dict[str, Any]]]
 def build_tool_dispatch(
     session: AsyncSession,
     current_user_id: int,
+    llm: Any | None = None,
+    settings: Settings | None = None,
 ) -> dict[str, ToolHandler]:
-    """生成工具名 -> 协程 的派发表，已绑定 session 与当前用户。"""
+    """生成工具名 -> 协程 的派发表，已绑定 session 与当前用户。
+
+    chat_with_agent 工具需要 llm 与 settings；其余 6 个工具仅需 session/user。
+    若调用方未提供 llm/settings，chat_with_agent 调用时会返回友好错误。
+    """
 
     async def _search(arguments: dict[str, Any]) -> dict[str, Any]:
         return await search_similar_users(
@@ -425,6 +489,17 @@ def build_tool_dispatch(
     async def _stats(arguments: dict[str, Any]) -> dict[str, Any]:
         return await get_community_stats(session=session, current_user_id=current_user_id)
 
+    async def _chat_with_agent(arguments: dict[str, Any]) -> dict[str, Any]:
+        if llm is None or settings is None:
+            return {"ok": False, "message": "系统暂时无法发起定向对话，请稍后再试"}
+        return await chat_with_agent(
+            session=session,
+            current_user_id=current_user_id,
+            target=str(arguments.get("target", "")),
+            llm=llm,
+            settings=settings,
+        )
+
     return {
         "search_similar_users": _search,
         "get_my_recommendations": _get_recs,
@@ -432,6 +507,7 @@ def build_tool_dispatch(
         "forget_memory": _forget,
         "get_my_profile": _profile,
         "get_community_stats": _stats,
+        "chat_with_agent": _chat_with_agent,
     }
 
 

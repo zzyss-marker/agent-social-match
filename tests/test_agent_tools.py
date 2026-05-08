@@ -27,6 +27,7 @@ async def test_tool_schemas_have_required_fields():
         "forget_memory",
         "get_my_profile",
         "get_community_stats",
+        "chat_with_agent",
     }
     for tool in TOOL_SCHEMAS:
         assert tool["type"] == "function"

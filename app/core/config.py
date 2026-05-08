@@ -31,9 +31,17 @@ class Settings(BaseSettings):
     DISCOVERY_CHAT_MAX_PER_RUN: int = 3
     DISCOVERY_CANDIDATE_POOL_LIMIT: int = 80
     DISCOVERY_REC_COOLDOWN_HOURS: int = 24
+    # 评估过但未生成 rec 的 pair 的短冷却，避免一直在 top-1 死循环
+    DISCOVERY_ATTEMPT_COOLDOWN_HOURS: int = 6
     DISCOVERY_MIN_MATCH_SCORE: int = 68
     DISCOVERY_MIN_CONFIDENCE: int = 55
     DISCOVERY_MAX_PENDING_RECOMMENDATIONS: int = 20
+    # MMR 多样性重排：λ=1 纯相关，λ=0 纯多样；recsys 推荐起点 0.6-0.7
+    DISCOVERY_MMR_LAMBDA: float = 0.7
+    # ε-greedy 探索率：每次有 ε 的概率从全池随机选一个 MMR 之外的候选，避免局部最优
+    DISCOVERY_EPSILON: float = 0.3
+    # chat_with_agent 工具：单 Agent 每天最多主动定向调用次数
+    DISCOVERY_DIRECTED_DAILY_LIMIT: int = 3
 
     # Dashboard scalability controls
     COMMUNITY_PAGE_SIZE: int = 24

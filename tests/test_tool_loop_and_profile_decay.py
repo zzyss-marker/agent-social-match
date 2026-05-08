@@ -123,12 +123,14 @@ async def test_get_community_stats(session):
 def test_profile_lru_pushes_old_items_out():
     from app.main import _merge_profile
 
-    old = {"interests": [f"interest{i}" for i in range(10)], "traits": []}
-    new = {"interests": ["interest_NEW"]}
+    # 用真实风格的不同兴趣词，避免被 bigram 语义去重合并，单纯验证 LRU + cap
+    old_interests = ["运动", "读书", "音乐", "电影", "旅行", "美食", "摄影", "游戏", "动漫", "编程"]
+    old = {"interests": old_interests, "traits": []}
+    new = {"interests": ["写作"]}
     merged = _merge_profile(old, new)
-    assert merged["interests"][0] == "interest_NEW"
+    assert merged["interests"][0] == "写作"
     assert len(merged["interests"]) == 10
-    assert "interest9" not in merged["interests"]
+    assert "编程" not in merged["interests"]  # 最旧的被挤出
 
 
 def test_profile_lru_keeps_new_first():

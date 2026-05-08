@@ -339,18 +339,51 @@ class LLMClient:
         except json.JSONDecodeError:
             return {"raw": text}
 
-    async def extract_personality(self, conversation: list[dict[str, Any]]) -> dict[str, Any]:
+    async def extract_personality(
+        self,
+        conversation: list[dict[str, Any]],
+        existing: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        existing_block = ""
+        if isinstance(existing, dict):
+            ex_traits = [str(x).strip() for x in (existing.get("traits") or []) if str(x).strip()][:10]
+            ex_interests = [str(x).strip() for x in (existing.get("interests") or []) if str(x).strip()][:10]
+            if ex_traits or ex_interests:
+                existing_block = (
+                    "\n\n用户已有画像（不要重复添加，只输出本轮对话里真正新增的概念）：\n"
+                    f"已有 traits = {ex_traits}\n"
+                    f"已有 interests = {ex_interests}\n"
+                    "规则：如果新发现的内容只是已有条目的同义词/词序变体/上下位词"
+                    "（例：'乐园模式' / '乐园模式游戏' / '蛋仔派对乐园模式' 是同一个概念），"
+                    "**不要列入返回**，由系统沿用已有条目。只在出现真正全新的概念时才返回。"
+                )
         system = {
             "role": "system",
             "content": (
                 "你是用户画像提炼助手。请只基于对话中的明确信息提取并仅返回 JSON："
                 '{"traits":["特征1","特征2"],"interests":["兴趣1"],'
                 '"looking_for":"用户在寻找什么","vibe":"相处氛围"}'
+                + existing_block
             ),
         }
         return await self.chat_json([system] + conversation, temperature=0.1, max_tokens=260)
 
-    async def extract_user_context(self, conversation: list[dict[str, Any]]) -> dict[str, Any]:
+    async def extract_user_context(
+        self,
+        conversation: list[dict[str, Any]],
+        existing: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        existing_block = ""
+        if isinstance(existing, dict):
+            ex_cm = [str(x).strip() for x in (existing.get("context_memory") or []) if str(x).strip()][:10]
+            ex_bd = [str(x).strip() for x in (existing.get("boundaries") or []) if str(x).strip()][:8]
+            if ex_cm or ex_bd:
+                existing_block = (
+                    "\n\n已有长期记忆（不要重复，只输出真正新增的事实）：\n"
+                    f"已有 context_memory = {ex_cm}\n"
+                    f"已有 boundaries = {ex_bd}\n"
+                    "规则：新事实如果和已有事实表达同一件事（同义/换说法），不要列入返回。"
+                )
         system = {
             "role": "system",
             "content": (
@@ -359,6 +392,7 @@ class LLMClient:
                 '{"context_memory":["稳定事实1","稳定事实2"],'
                 '"boundaries":["不接受项1"],'
                 '"conversation_style":"用户偏好的沟通方式"}'
+                + existing_block
             ),
         }
         return await self.chat_json([system] + conversation, temperature=0.0, max_tokens=260)

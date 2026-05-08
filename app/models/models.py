@@ -97,3 +97,21 @@ class Recommendation(Base, TimestampMixin):
     from_approved: Mapped[bool] = mapped_column(Boolean, default=False)
     to_approved: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending, mutual, rejected
+
+
+class DiscoveryAttempt(Base, TimestampMixin):
+    """Agent-Agent 发现过程中的"尝试"记录（无论是否生成 Recommendation）。
+
+    用途：让 _load_blocked_targets 能识别"评估过但分数不够"的 pair，
+    给它们一个短冷却（DISCOVERY_ATTEMPT_COOLDOWN_HOURS），避免 mode collapse
+    一直挑同一个 top-1 候选。
+    """
+
+    __tablename__ = "discovery_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    from_agent_id: Mapped[int] = mapped_column(Integer, ForeignKey("agents.id"), nullable=False)
+    to_agent_id: Mapped[int] = mapped_column(Integer, ForeignKey("agents.id"), nullable=False)
+    produced_rec: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source: Mapped[str] = mapped_column(String(20), default="auto", nullable=False)  # auto / directed

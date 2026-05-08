@@ -16,6 +16,7 @@ from app.models.models import (
     Agent,
     Conversation,
     ConversationParticipant,
+    DiscoveryAttempt,
     Message,
     Recommendation,
 )
@@ -48,6 +49,45 @@ def _to_set(value: Any) -> set[str]:
     return {str(v).strip().lower() for v in value if str(v).strip()}
 
 
+def _bigrams_lower(s: str) -> set[str]:
+    s = str(s).strip().lower()
+    if len(s) <= 1:
+        return {s} if s else set()
+    return {s[i : i + 2] for i in range(len(s) - 1)}
+
+
+def _fuzzy_overlap_count(a_items: set[str], b_items: set[str]) -> float:
+    """Token-bigram 模糊重合计数（containment ratio）。
+
+    对每个 a 中的条目，找到 b 里最接近的（bigram 含 ratio = inter / min），
+    把含 ratio（≥0.3 才计入）累加。这样 "蛋仔派对" / "派对游戏" 共享一个
+    token "派对" 时也会贡献正向信号（containment ≈ 0.33），解决 set 严格
+    交集为 0 导致的"看似合理却不被召回"问题。
+    """
+    if not a_items or not b_items:
+        return 0.0
+    b_bigrams = [(item, _bigrams_lower(item)) for item in b_items]
+    total = 0.0
+    for a_item in a_items:
+        ag = _bigrams_lower(a_item)
+        if not ag:
+            continue
+        best = 0.0
+        for _b_item, bg in b_bigrams:
+            if not bg:
+                continue
+            inter = len(ag & bg)
+            smaller = min(len(ag), len(bg))
+            if smaller == 0:
+                continue
+            containment = inter / smaller
+            if containment > best:
+                best = containment
+        if best >= 0.3:
+            total += best
+    return total
+
+
 def _prefilter_score(a: dict[str, Any], b: dict[str, Any]) -> float:
     """Cheap retrieval score to reduce LLM calls when agent pool is large.
 
@@ -58,7 +98,10 @@ def _prefilter_score(a: dict[str, Any], b: dict[str, Any]) -> float:
 
 
 def _rule_overlap_score(a: dict[str, Any], b: dict[str, Any]) -> float:
-    """规则信号：兴趣/特征/looking_for/vibe 的集合重合度。"""
+    """规则信号：兴趣/特征/looking_for/vibe 的混合重合度。
+
+    集合精确交集 + bigram Jaccard 模糊重合 → 让 "蛋仔派对" 与 "派对游戏" 也能部分 match。
+    """
     a_traits = _to_set(a.get("traits"))
     b_traits = _to_set(b.get("traits"))
     a_interests = _to_set(a.get("interests"))
@@ -68,12 +111,24 @@ def _rule_overlap_score(a: dict[str, Any], b: dict[str, Any]) -> float:
     a_vibe = str(a.get("vibe", "")).strip()
     b_vibe = str(b.get("vibe", "")).strip()
 
-    trait_overlap = len(a_traits & b_traits)
-    interest_overlap = len(a_interests & b_interests)
+    # 精确交集（强信号）
+    trait_exact = len(a_traits & b_traits)
+    interest_exact = len(a_interests & b_interests)
+    # 模糊匹配（弱信号，但能补救字面不同的同义词）
+    interest_fuzzy = _fuzzy_overlap_count(a_interests - b_interests, b_interests - a_interests)
+    trait_fuzzy = _fuzzy_overlap_count(a_traits - b_traits, b_traits - a_traits)
+
     looking_bonus = 1 if a_looking_for and b_looking_for and a_looking_for == b_looking_for else 0
     vibe_bonus = 1 if a_vibe and b_vibe and a_vibe == b_vibe else 0
 
-    return (interest_overlap * 1.8) + (trait_overlap * 1.2) + (looking_bonus * 1.2) + (vibe_bonus * 0.8)
+    return (
+        interest_exact * 1.8
+        + trait_exact * 1.2
+        + interest_fuzzy * 0.9
+        + trait_fuzzy * 0.6
+        + looking_bonus * 1.2
+        + vibe_bonus * 0.8
+    )
 
 
 def hybrid_recall_score(
@@ -115,8 +170,20 @@ async def _load_blocked_targets(
     session: AsyncSession,
     agent_id: int,
     cooldown_hours: int,
+    attempt_cooldown_hours: int,
 ) -> set[int]:
-    since = now_utc8() - timedelta(hours=max(1, cooldown_hours))
+    """两层冷却：
+
+    1) Recommendation 表：pending 状态永久屏蔽，已产生过 rec 的 pair 在 cooldown_hours 内屏蔽
+    2) DiscoveryAttempt 表：评估过但没生成 rec 的 pair 在 attempt_cooldown_hours 内短冷却
+       （避免同一 top-1 候选每次都被选、每次都不够分，死循环卡住）
+    """
+    rec_since = now_utc8() - timedelta(hours=max(1, cooldown_hours))
+    attempt_since = now_utc8() - timedelta(hours=max(1, attempt_cooldown_hours))
+
+    blocked: set[int] = set()
+
+    # 1) Recommendation 屏蔽
     rows = (
         await session.execute(
             select(
@@ -132,13 +199,33 @@ async def _load_blocked_targets(
             )
         )
     ).all()
-
-    blocked: set[int] = set()
     for from_id, to_id, status, created_at in rows:
         peer_id = to_id if from_id == agent_id else from_id
         created = _as_aware_utc8(created_at)
-        if status == "pending" or created >= since:
+        if status == "pending" or created >= rec_since:
             blocked.add(int(peer_id))
+
+    # 2) DiscoveryAttempt 短冷却（不论是否产生 rec，最近评估过都短期屏蔽）
+    attempt_rows = (
+        await session.execute(
+            select(
+                DiscoveryAttempt.from_agent_id,
+                DiscoveryAttempt.to_agent_id,
+                DiscoveryAttempt.created_at,
+            ).where(
+                or_(
+                    DiscoveryAttempt.from_agent_id == agent_id,
+                    DiscoveryAttempt.to_agent_id == agent_id,
+                )
+            )
+        )
+    ).all()
+    for from_id, to_id, created_at in attempt_rows:
+        peer_id = to_id if from_id == agent_id else from_id
+        created = _as_aware_utc8(created_at)
+        if created >= attempt_since:
+            blocked.add(int(peer_id))
+
     return blocked
 
 
@@ -155,6 +242,95 @@ async def _pending_recommendation_count(session: AsyncSession, my_agent_id: int)
         )
     )
     return int(result.scalar() or 0)
+
+
+def _mmr_select(
+    candidates: list[tuple[float, Agent, list[float]]],
+    k: int,
+    lambda_: float = 0.7,
+) -> list[Agent]:
+    """Maximal Marginal Relevance 重排：相关度 + 候选间相似度惩罚。
+
+    Carbonell & Goldstein 1998. 公式：
+      MMR = argmax_i [ λ · Rel(i) - (1-λ) · max_{j∈selected} Sim(i, j) ]
+
+    candidates: list of (relevance_score, Agent, embedding_vector)
+    每次贪心选下一个：在剩余候选里挑 MMR 分最高的，直到选满 k 个。
+    """
+    if not candidates:
+        return []
+    if k >= len(candidates):
+        return [c[1] for c in candidates]
+
+    # 已选 / 剩余
+    selected: list[tuple[float, Agent, list[float]]] = []
+    remaining = list(candidates)
+
+    # 先选相关度最高的（max_sim 项为 0）
+    remaining.sort(key=lambda x: x[0], reverse=True)
+    selected.append(remaining.pop(0))
+
+    while remaining and len(selected) < k:
+        best_idx = 0
+        best_score = -1e9
+        for i, (rel, _agent, vec) in enumerate(remaining):
+            max_sim = 0.0
+            if vec:
+                for _, _sa, sv in selected:
+                    if not sv:
+                        continue
+                    sim = cosine_similarity(vec, sv)
+                    if sim > max_sim:
+                        max_sim = sim
+            score = lambda_ * rel - (1.0 - lambda_) * max_sim
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        selected.append(remaining.pop(best_idx))
+
+    return [c[1] for c in selected]
+
+
+def _epsilon_greedy_swap(
+    mmr_picks: list[Agent],
+    full_pool: list[Agent],
+    epsilon: float,
+) -> list[Agent]:
+    """在 MMR 结果之上做 ε-greedy 探索：
+
+    以概率 ε 把最后一个 MMR 候选替换为"全池中未被选中的随机一个"。
+    这是 SMMR (Sampling-based MMR) 的简化版，让"分数较低但可能合得来"的人也有机会被探索。
+    """
+    if not mmr_picks or epsilon <= 0:
+        return mmr_picks
+    if random.random() >= epsilon:
+        return mmr_picks
+    picked_ids = {a.id for a in mmr_picks}
+    outsiders = [a for a in full_pool if a.id not in picked_ids]
+    if not outsiders:
+        return mmr_picks
+    swap_in = random.choice(outsiders)
+    return mmr_picks[:-1] + [swap_in]
+
+
+async def _record_attempt(
+    session: AsyncSession,
+    from_agent_id: int,
+    to_agent_id: int,
+    produced_rec: bool,
+    score: int | None,
+    source: str = "auto",
+) -> None:
+    """落一条 DiscoveryAttempt 记录，让短冷却生效。"""
+    session.add(
+        DiscoveryAttempt(
+            from_agent_id=from_agent_id,
+            to_agent_id=to_agent_id,
+            produced_rec=produced_rec,
+            score=score,
+            source=source,
+        )
+    )
 
 
 async def run_discovery(
@@ -200,22 +376,25 @@ async def run_discovery(
             session=session,
             agent_id=my_snapshot.id,
             cooldown_hours=settings.DISCOVERY_REC_COOLDOWN_HOURS,
+            attempt_cooldown_hours=settings.DISCOVERY_ATTEMPT_COOLDOWN_HOURS,
         )
 
-        scored: list[tuple[float, Agent]] = []
+        # scored: (relevance_score, Agent, embedding_vector) — embedding 留作 MMR 重排用
+        scored: list[tuple[float, Agent, list[float]]] = []
         for candidate in candidates:
             if candidate.id in blocked_targets:
                 continue
-            # 1) 规则重合度
+            # 1) 规则重合度（精确交集 + bigram Jaccard 模糊匹配）
             rule_score = _rule_overlap_score(my_snapshot.personality, candidate.personality or {})
             # 2) 向量 cosine（候选向量按需生成）
+            cand_vec: list[float] = []
             try:
-                cand_vec = await ensure_agent_embedding(session, candidate, settings)
+                cand_vec = await ensure_agent_embedding(session, candidate, settings) or []
                 cos = cosine_similarity(my_vector, cand_vec) if my_vector and cand_vec else 0.0
             except Exception:
                 cos = 0.0
             score = hybrid_recall_score(rule_score, cos)
-            scored.append((score, candidate))
+            scored.append((score, candidate, cand_vec))
 
         if not scored:
             my_agent.status = "idle"
@@ -224,14 +403,25 @@ async def run_discovery(
 
         scored.sort(key=lambda item: item[0], reverse=True)
         candidate_pool_limit = max(1, settings.DISCOVERY_CANDIDATE_POOL_LIMIT)
-        candidate_pool = [item[1] for item in scored[:candidate_pool_limit]]
+        candidate_pool = scored[:candidate_pool_limit]
 
         min_chat = max(1, settings.DISCOVERY_CHAT_MIN_PER_RUN)
         max_chat = max(min_chat, settings.DISCOVERY_CHAT_MAX_PER_RUN)
         num_to_chat = min(random.randint(min_chat, max_chat), len(candidate_pool))
-        selection_window_size = min(len(candidate_pool), max(num_to_chat * 3, 12))
-        selection_window = candidate_pool[:selection_window_size]
-        selected = random.sample(selection_window, num_to_chat)
+
+        # MMR 重排：在 top-K 池中权衡相关度 vs 候选间多样性，避免每次都挑最像的同一拨人
+        mmr_picks = _mmr_select(
+            candidate_pool,
+            k=num_to_chat,
+            lambda_=float(settings.DISCOVERY_MMR_LAMBDA),
+        )
+        # ε-greedy 探索：偶尔跳出 MMR 头部，把"分数稍低但可能合得来"的候选也试一下
+        full_pool_agents = [c[1] for c in candidate_pool]
+        selected = _epsilon_greedy_swap(
+            mmr_picks,
+            full_pool_agents,
+            epsilon=float(settings.DISCOVERY_EPSILON),
+        )
 
         # Materialize snapshots before commits/rollbacks to avoid expired ORM lazy-load issues.
         selected_snapshots = [
@@ -257,6 +447,15 @@ async def run_discovery(
                     min_match_score=max(0, settings.DISCOVERY_MIN_MATCH_SCORE),
                     min_confidence=max(0, settings.DISCOVERY_MIN_CONFIDENCE),
                 )
+                # 不论是否产生 rec，都记一条 attempt 用于短冷却
+                await _record_attempt(
+                    session,
+                    from_agent_id=my_snapshot.id,
+                    to_agent_id=target_snapshot.id,
+                    produced_rec=bool(rec),
+                    score=rec["score"] if rec else None,
+                    source="auto",
+                )
                 await session.commit()
                 if rec:
                     new_recs += 1
@@ -276,6 +475,98 @@ async def run_discovery(
         await session.flush()
 
         return DiscoveryResponse(new_recommendations=new_recs, details=details)
+
+
+async def run_directed_discovery(
+    session: AsyncSession,
+    agent_id: int,
+    target_query: str,
+    llm: LLMClient,
+    settings: Settings,
+) -> dict[str, Any]:
+    """主动定向 1:1 探索：让指定 Agent 与某个目标 Agent（按名字模糊匹配）开聊并评估。
+
+    用于 `chat_with_agent` 工具：复用 _agent_chat_and_evaluate 链路，但 candidates 固定为
+    名字命中的那一个，绕过 MMR / 短冷却（因为是用户明确指定的目标）。
+
+    速率：DISCOVERY_DIRECTED_DAILY_LIMIT 控制单 Agent 每日定向调用上限。
+    """
+    target_query = (target_query or "").strip()
+    if not target_query:
+        return {"ok": False, "message": "请告诉我要找哪位 Agent（名字或关键词）"}
+
+    me = (await session.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
+    if me is None:
+        return {"ok": False, "message": "Agent 不存在"}
+
+    # 速率限制：今日已经做过几次定向
+    since_today = now_utc8() - timedelta(hours=24)
+    today_count = (
+        await session.execute(
+            select(func.count(DiscoveryAttempt.id)).where(
+                and_(
+                    DiscoveryAttempt.from_agent_id == agent_id,
+                    DiscoveryAttempt.source == "directed",
+                    DiscoveryAttempt.created_at >= since_today,
+                )
+            )
+        )
+    ).scalar() or 0
+    daily_limit = max(1, settings.DISCOVERY_DIRECTED_DAILY_LIMIT)
+    if today_count >= daily_limit:
+        return {
+            "ok": False,
+            "message": f"今天主动找别人聊的次数已经用完（{daily_limit} 次/天），明天再来。",
+        }
+
+    # 按名字模糊匹配候选
+    rows = (
+        await session.execute(
+            select(Agent).where(and_(Agent.id != agent_id, Agent.name.like(f"%{target_query}%")))
+        )
+    ).scalars().all()
+    if not rows:
+        return {"ok": False, "message": f"社区里没找到名字像 '{target_query}' 的 Agent"}
+    target = rows[0]
+
+    my_snapshot = AgentSnapshot(
+        id=me.id, name=me.name, personality=strip_internal_fields(me.personality or {})
+    )
+    target_snapshot = AgentSnapshot(
+        id=int(target.id), name=str(target.name),
+        personality=strip_internal_fields(target.personality or {}),
+    )
+
+    rec = await _agent_chat_and_evaluate(
+        session=session,
+        agent_a=my_snapshot,
+        agent_b=target_snapshot,
+        llm=llm,
+        min_match_score=max(0, settings.DISCOVERY_MIN_MATCH_SCORE),
+        min_confidence=max(0, settings.DISCOVERY_MIN_CONFIDENCE),
+    )
+    await _record_attempt(
+        session,
+        from_agent_id=my_snapshot.id,
+        to_agent_id=target_snapshot.id,
+        produced_rec=bool(rec),
+        score=rec["score"] if rec else None,
+        source="directed",
+    )
+    await session.commit()
+
+    return {
+        "ok": True,
+        "target_name": target_snapshot.name,
+        "produced_rec": bool(rec),
+        "score": rec["score"] if rec else None,
+        "message": (
+            f"已和 {target_snapshot.name} 聊过，对话评分 {rec['score']} 分，已生成推荐。"
+            if rec
+            else f"已和 {target_snapshot.name} 聊过，但本轮没达到推荐阈值。"
+        ),
+        "remaining_today": daily_limit - int(today_count) - 1,
+    }
 
 
 async def _agent_chat_and_evaluate(

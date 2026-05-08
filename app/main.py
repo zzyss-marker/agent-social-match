@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -190,6 +191,30 @@ def _apply_startup_schema_patches(sync_conn) -> None:
         if "risks" not in rec_columns:
             sync_conn.execute(text("ALTER TABLE recommendations ADD COLUMN risks TEXT NOT NULL DEFAULT '[]'"))
 
+    if "discovery_attempts" not in table_names:
+        sync_conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS discovery_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    from_agent_id INTEGER NOT NULL,
+                    to_agent_id INTEGER NOT NULL,
+                    produced_rec BOOLEAN NOT NULL DEFAULT 0,
+                    score INTEGER NULL,
+                    source VARCHAR(20) NOT NULL DEFAULT 'auto',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        sync_conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_discovery_attempts_pair "
+                "ON discovery_attempts(from_agent_id, to_agent_id, created_at)"
+            )
+        )
+
     if "email_verification_codes" not in table_names:
         sync_conn.execute(
             text(
@@ -215,6 +240,45 @@ def _apply_startup_schema_patches(sync_conn) -> None:
         )
     )
 
+    # 一次性数据清洗：把已存的 agent.personality 中的语义重复项合并掉
+    # 例：[蛋仔派对, 乐园模式游戏, 乐园模式, 游戏乐园模式, 蛋仔派对乐园模式]
+    #   → [蛋仔派对乐园模式]（保留最具体的）
+    if "agents" in table_names:
+        try:
+            _migrate_dedupe_existing_profiles(sync_conn)
+        except Exception as exc:  # noqa: BLE001
+            # 迁移失败不应阻断启动；清洗会在下一次画像合并时自然发生
+            logger.warning("profile_dedup_migration_failed", error=str(exc))
+
+
+def _migrate_dedupe_existing_profiles(sync_conn) -> None:
+    """启动时清洗存量 agent.personality 中的语义重复条目。"""
+    rows = sync_conn.execute(text("SELECT id, personality FROM agents")).fetchall()
+    updated = 0
+    for row in rows:
+        agent_id = row[0]
+        raw = row[1]
+        if not raw:
+            continue
+        try:
+            data = raw if isinstance(raw, dict) else json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        before = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        normalized = _normalize_profile(data)
+        # 保留 normalize 不动的字段（snapshots 已限 20 条）
+        after = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+        if after != before:
+            sync_conn.execute(
+                text("UPDATE agents SET personality = :p WHERE id = :id"),
+                {"p": json.dumps(normalized, ensure_ascii=False), "id": agent_id},
+            )
+            updated += 1
+    if updated:
+        logger.info("profile_dedup_migration_done", updated=updated, total=len(rows))
+
 
 def _normalize_profile(profile: Any) -> dict[str, Any]:
     if not isinstance(profile, dict):
@@ -229,18 +293,8 @@ def _normalize_profile(profile: Any) -> dict[str, Any]:
         return []
 
     def _dedupe(items: list[str], limit: int = 20) -> list[str]:
-        seen: set[str] = set()
-        out: list[str] = []
-        for item in items:
-            key = item.strip()
-            if not key:
-                continue
-            if key not in seen:
-                seen.add(key)
-                out.append(key)
-            if len(out) >= limit:
-                break
-        return out
+        # 语义去重：相同/子串/bigram 高重合度都合并，避免"乐园模式 / 乐园模式游戏 / 蛋仔派对乐园模式"挤满槽位
+        return _dedupe_semantic(items)[:limit]
 
     snapshots = profile.get("snapshots")
     if not isinstance(snapshots, list):
@@ -251,8 +305,8 @@ def _normalize_profile(profile: Any) -> dict[str, Any]:
     conversation_style = str(profile.get("conversation_style", "")).strip()
 
     return {
-        "traits": _to_list(profile.get("traits")),
-        "interests": _to_list(profile.get("interests")),
+        "traits": _dedupe(_to_list(profile.get("traits"))),
+        "interests": _dedupe(_to_list(profile.get("interests"))),
         "looking_for": str(profile.get("looking_for", "")).strip(),
         "vibe": str(profile.get("vibe", "")).strip(),
         "context_memory": context_memory,
@@ -262,14 +316,74 @@ def _normalize_profile(profile: Any) -> dict[str, Any]:
     }
 
 
-def _unique_keep_order(items: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
+def _bigrams(s: str) -> set[str]:
+    s = s.strip()
+    if len(s) <= 1:
+        return {s} if s else set()
+    return {s[i : i + 2] for i in range(len(s) - 1)}
+
+
+def _is_semantic_dup(a: str, b: str) -> bool:
+    """两个画像条目是否表达同一概念。
+
+    判定（任一命中即视为重复）：
+      1) 去空白后完全相等
+      2) 一个是另一个的子串（如 "乐园模式" ⊂ "蛋仔派对乐园模式"）
+      3) 字符 bigram 包含率 ≥ 0.6（处理"游戏乐园模式" vs "乐园模式游戏" / "蛋仔派对乐园模式"）
+
+    Reason: extract_personality 多轮反复抽取会产出同义/上下位变体，
+            纯字符串相等的去重会让 cap=10 的 interests 槽被同一概念塞满。
+    """
+    a, b = a.strip(), b.strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if a in b or b in a:
+        return True
+    ag, bg = _bigrams(a), _bigrams(b)
+    if not ag or not bg:
+        return False
+    inter = len(ag & bg)
+    smaller = min(len(ag), len(bg))
+    return smaller > 0 and inter / smaller >= 0.6
+
+
+def _dedupe_semantic(items: list[str]) -> list[str]:
+    """保序语义去重，跑到不动点。
+
+    单 pass 处理顺序敏感（如 "蛋仔派对" → "蛋仔派对乐园模式" 的 in-place 替换之后，
+    新替换项可能与后续条目再形成重复）。所以这里跑到不动点，保证收敛。
+    """
+
+    def _one_pass(seq: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in seq:
+            item = str(raw).strip()
+            if not item:
+                continue
+            dup_idx: int | None = None
+            for i, existing in enumerate(out):
+                if _is_semantic_dup(item, existing):
+                    dup_idx = i
+                    break
+            if dup_idx is None:
+                out.append(item)
+            elif len(item) > len(out[dup_idx]):
+                out[dup_idx] = item
+        return out
+
+    prev = list(items)
+    for _ in range(5):  # 上界 5 轮，实际通常 1-2 轮即收敛
+        curr = _one_pass(prev)
+        if curr == prev:
+            return curr
+        prev = curr
+    return prev
+
+
+# 兼容老调用点：_unique_keep_order 现等价于语义去重
+_unique_keep_order = _dedupe_semantic
 
 
 # 画像各字段的容量上限（更小的 cap + LRU 机制 = 旧条目自然被新条目挤出）
@@ -341,12 +455,15 @@ def _build_chat_system_prompt(agent_name: str, personality: dict[str, Any]) -> s
         f"用户边界偏好：{boundaries if boundaries else '暂无'}。\n"
         f"沟通偏好：{profile['conversation_style'] or '自然、具体、少废话'}。\n"
         "\n=== 工具使用（最高优先级，必须先判断要不要调） ===\n"
-        "你有 6 个可调用的工具，遇到以下情况必须主动调用，不要拒答也不要假装查不到。\n"
+        "你有 7 个可调用的工具，遇到以下情况必须主动调用，不要拒答也不要假装查不到。\n"
         "**同一工具同一参数在一次回复里只调用一次，不要重复调。**\n"
         "  - search_similar_users(keyword): 用户想了解社区里其他用户/Agent 时调用。\n"
         "    触发例子：'社区里都有谁'、'有没有像我一样喜欢XX的人'、'还有什么 Agent'、\n"
         "    '系统里有哪些 agent'、'帮我看看其他用户'、'谁喜欢动漫'、'有谁'。\n"
         "    keyword 是搜索关键词；问'有谁'但没说具体兴趣时，keyword 传空字符串。\n"
+        "  - chat_with_agent(target): 用户想让你主动找指定 Agent 聊天评估匹配时调用。\n"
+        "    触发例子：'帮我和XX聊聊'、'去找XX聊一下'、'我想认识XX'、'帮我约一下XX'。\n"
+        "    target 传目标 Agent 的名字或关键词。**每天最多调 3 次**，调用后会真正发起一次 Agent-Agent 对话+评估。\n"
         "  - get_my_recommendations(status): 用户问自己的推荐情况时调用。\n"
         "    触发例子：'我的推荐怎么样了'、'有人推荐我了吗'。\n"
         "  - update_my_boundary(item): 用户明确表达不接受某事时调用。\n"
@@ -1209,10 +1326,12 @@ def create_app() -> FastAPI:
                 agent_reply = fallback_reply
             else:
                 try:
-                    # Tool Use：让 Agent 能主动调用 search_similar_users 等工具
+                    # Tool Use：让 Agent 能主动调用 search_similar_users / chat_with_agent 等工具
                     tool_dispatch = build_tool_dispatch(
                         session=session,
                         current_user_id=user_id,
+                        llm=llm,
+                        settings=app.state.settings,
                     )
                     agent_reply, tool_traces = await llm.chat_with_tools_traced(
                         [system_prompt] + llm_messages,
@@ -1246,8 +1365,14 @@ def create_app() -> FastAPI:
             user_turns = sum(1 for m in recent_messages if m.sender_role == "user")
             if llm is not None and user_turns > 0 and user_turns % 3 == 0:
                 try:
-                    extracted_profile = await llm.extract_personality(llm_messages)
-                    extracted_context = await llm.extract_user_context(llm_messages)
+                    # 把已有画像喂给提取器，让它在源头就避免输出已有概念的同义词/变体
+                    current_profile = agent_resp.personality or {}
+                    extracted_profile = await llm.extract_personality(
+                        llm_messages, existing=current_profile
+                    )
+                    extracted_context = await llm.extract_user_context(
+                        llm_messages, existing=current_profile
+                    )
                     extracted: dict[str, Any] = {}
                     if isinstance(extracted_profile, dict):
                         extracted.update(extracted_profile)
