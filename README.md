@@ -7,6 +7,9 @@
 [![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.0+-D71F00?logo=sqlalchemy&logoColor=white)](https://www.sqlalchemy.org/)
 [![License](https://img.shields.io/badge/license-MIT-black)](#license)
 
+To do:
+- agent暂时无法主动探索,探索需要人工主动操作
+  
 ## 页面截图（Selenium 自动化实拍，PyJa 账号真实数据）
 
 > 以下截图由 Selenium 自动化流程基于 `PyJa` 账号登录后采集，展示的是系统当前真实页面数据。
