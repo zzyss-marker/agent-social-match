@@ -6,7 +6,8 @@ LLM 决定调用哪个工具 → 系统执行 → 把结果作为 tool role 消�
 from __future__ import annotations
 
 import json
-from typing import Any, Awaitable, Callable
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -442,63 +443,85 @@ ToolHandler = Callable[..., Awaitable[dict[str, Any]]]
 
 
 def build_tool_dispatch(
-    session: AsyncSession,
+    session: AsyncSession | None,
     current_user_id: int,
     llm: Any | None = None,
     settings: Settings | None = None,
+    session_factory: Callable[[], AsyncSession] | None = None,
 ) -> dict[str, ToolHandler]:
     """生成工具名 -> 协程 的派发表，已绑定 session 与当前用户。
 
     chat_with_agent 工具需要 llm 与 settings；其余 6 个工具仅需 session/user。
     若调用方未提供 llm/settings，chat_with_agent 调用时会返回友好错误。
+
+    传入 session_factory 时，每个工具调用都使用独立短会话并在结束时立即
+    提交，避免工具执行（尤其 chat_with_agent 的定向探索）期间长期占用
+    发起方请求的数据库事务；未传入时保持旧行为，复用绑定的 session。
     """
 
+    @asynccontextmanager
+    async def _tool_session() -> AsyncIterator[AsyncSession]:
+        if session_factory is not None:
+            async with session_factory() as s:
+                yield s
+                await s.commit()
+        else:
+            # 兼容旧调用：直接复用调用方绑定的 session，由调用方负责提交
+            yield session  # type: ignore[misc]
+
     async def _search(arguments: dict[str, Any]) -> dict[str, Any]:
-        return await search_similar_users(
-            session=session,
-            current_user_id=current_user_id,
-            keyword=str(arguments.get("keyword", "")),
-            limit=int(arguments.get("limit", 5) or 5),
-        )
+        async with _tool_session() as s:
+            return await search_similar_users(
+                session=s,
+                current_user_id=current_user_id,
+                keyword=str(arguments.get("keyword", "")),
+                limit=int(arguments.get("limit", 5) or 5),
+            )
 
     async def _get_recs(arguments: dict[str, Any]) -> dict[str, Any]:
-        return await get_my_recommendations(
-            session=session,
-            current_user_id=current_user_id,
-            status=str(arguments.get("status", "pending")),
-        )
+        async with _tool_session() as s:
+            return await get_my_recommendations(
+                session=s,
+                current_user_id=current_user_id,
+                status=str(arguments.get("status", "pending")),
+            )
 
     async def _update_boundary(arguments: dict[str, Any]) -> dict[str, Any]:
-        return await update_my_boundary(
-            session=session,
-            current_user_id=current_user_id,
-            item=str(arguments.get("item", "")),
-        )
+        async with _tool_session() as s:
+            return await update_my_boundary(
+                session=s,
+                current_user_id=current_user_id,
+                item=str(arguments.get("item", "")),
+            )
 
     async def _forget(arguments: dict[str, Any]) -> dict[str, Any]:
-        return await forget_memory(
-            session=session,
-            current_user_id=current_user_id,
-            item=str(arguments.get("item", "")),
-            field=str(arguments.get("field", "auto")),
-        )
+        async with _tool_session() as s:
+            return await forget_memory(
+                session=s,
+                current_user_id=current_user_id,
+                item=str(arguments.get("item", "")),
+                field=str(arguments.get("field", "auto")),
+            )
 
     async def _profile(arguments: dict[str, Any]) -> dict[str, Any]:
-        return await get_my_profile(session=session, current_user_id=current_user_id)
+        async with _tool_session() as s:
+            return await get_my_profile(session=s, current_user_id=current_user_id)
 
     async def _stats(arguments: dict[str, Any]) -> dict[str, Any]:
-        return await get_community_stats(session=session, current_user_id=current_user_id)
+        async with _tool_session() as s:
+            return await get_community_stats(session=s, current_user_id=current_user_id)
 
     async def _chat_with_agent(arguments: dict[str, Any]) -> dict[str, Any]:
         if llm is None or settings is None:
             return {"ok": False, "message": "系统暂时无法发起定向对话，请稍后再试"}
-        return await chat_with_agent(
-            session=session,
-            current_user_id=current_user_id,
-            target=str(arguments.get("target", "")),
-            llm=llm,
-            settings=settings,
-        )
+        async with _tool_session() as s:
+            return await chat_with_agent(
+                session=s,
+                current_user_id=current_user_id,
+                target=str(arguments.get("target", "")),
+                llm=llm,
+                settings=settings,
+            )
 
     return {
         "search_similar_users": _search,

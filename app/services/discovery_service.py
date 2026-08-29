@@ -11,6 +11,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.core.db_gate import GatePriority, write_gate
 from app.core.time_utils import ensure_utc8, now_utc8
 from app.models.models import (
     Agent,
@@ -456,7 +457,13 @@ async def run_discovery(
                     score=rec["score"] if rec else None,
                     source="auto",
                 )
-                await session.commit()
+                # 探索提交走门闸 DISCOVERY 优先级，用户对话（CHAT）永远优先
+                async with write_gate(
+                    GatePriority.DISCOVERY,
+                    timeout=settings.DB_GATE_DEFAULT_TIMEOUT_SECONDS,
+                    label="discovery_run_commit",
+                ):
+                    await session.commit()
                 if rec:
                     new_recs += 1
                     details.append(
@@ -553,7 +560,12 @@ async def run_directed_discovery(
         score=rec["score"] if rec else None,
         source="directed",
     )
-    await session.commit()
+    async with write_gate(
+        GatePriority.DISCOVERY,
+        timeout=settings.DB_GATE_DEFAULT_TIMEOUT_SECONDS,
+        label="directed_discovery_commit",
+    ):
+        await session.commit()
 
     return {
         "ok": True,

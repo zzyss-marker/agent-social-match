@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import hmac
@@ -120,7 +119,12 @@ def _send_email_code_sync(settings: Settings, to_email: str, code: str) -> None:
         server.send_message(message)
 
 
-async def send_registration_code(session: AsyncSession, email: str, settings: Settings) -> None:
+async def create_registration_code(session: AsyncSession, email: str, settings: Settings) -> str:
+    """校验频控并落库一个注册验证码，返回明文 code。
+
+    只做数据库操作（由调用方提交事务）；邮件发送交给 send_code_email，
+    必须在事务提交之后进行，避免 SMTP 往返期间占用数据库会话/写锁。
+    """
     clean_email = normalize_email(email)
     if not is_valid_email(clean_email):
         raise ValueError("邮箱格式不正确")
@@ -186,8 +190,12 @@ async def send_registration_code(session: AsyncSession, email: str, settings: Se
     )
     session.add(record)
     await session.flush()
+    return code
 
-    await asyncio.to_thread(_send_email_code_sync, settings, clean_email, code)
+
+def send_code_email(settings: Settings, to_email: str, code: str) -> None:
+    """同步发送验证码邮件；供 asyncio.to_thread 在数据库会话之外调用。"""
+    _send_email_code_sync(settings, to_email, code)
 
 
 async def _consume_registration_code(

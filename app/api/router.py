@@ -1,11 +1,14 @@
 ﻿from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db, get_llm, get_settings
 from app.core.config import Settings
+from app.core.db_gate import GateAcquireTimeout, GatePriority, write_gate
 from app.models.models import Agent, ConversationParticipant
 from app.schemas.schemas import (
     AgentResponse,
@@ -40,25 +43,54 @@ async def send_register_email_code(
     settings: Settings = Depends(get_settings),
 ) -> dict:
     try:
-        await auth_service.send_registration_code(session, data.email, settings)
-        return {"message": "验证码已发送"}
+        async with write_gate(
+            GatePriority.INTERACT,
+            timeout=settings.DB_GATE_DEFAULT_TIMEOUT_SECONDS,
+            label="api_send_code",
+        ):
+            code = await auth_service.create_registration_code(session, data.email, settings)
+            await session.commit()
+    except GateAcquireTimeout:
+        raise HTTPException(status_code=503, detail="系统繁忙，请稍后再试")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail="验证码发送失败，请稍后重试")
 
+    # SMTP 在数据库会话之外发送
+    try:
+        await asyncio.to_thread(
+            auth_service.send_code_email, settings, auth_service.normalize_email(data.email), code
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="验证码发送失败，请稍后重试")
+    return {"message": "验证码已发送"}
+
 
 @api_router.post("/register")
 async def register(
     data: UserRegister,
+    request: Request,
     session: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> dict:
     try:
-        user, agent = await auth_service.register(session, data, settings)
-        return {"user": user.model_dump(), "agent": agent.model_dump()}
+        async with write_gate(
+            GatePriority.INTERACT,
+            timeout=settings.DB_GATE_DEFAULT_TIMEOUT_SECONDS,
+            label="api_register",
+        ):
+            user, agent = await auth_service.register(session, data, settings)
+            await session.commit()
+    except GateAcquireTimeout:
+        raise HTTPException(status_code=503, detail="系统繁忙，请稍后再试")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    avatar_queue = getattr(request.app.state, "avatar_queue", None)
+    if avatar_queue is not None:
+        avatar_queue.enqueue(agent.id)
+    return {"user": user.model_dump(), "agent": agent.model_dump()}
 
 
 @api_router.get("/users/{user_id}", response_model=UserResponse)

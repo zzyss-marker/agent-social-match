@@ -20,6 +20,7 @@ from starlette.responses import Response
 from app.api.router import api_router
 from app.core.config import Settings, resolve_data_dir
 from app.core.database import create_engine, create_session_factory
+from app.core.db_gate import GateAcquireTimeout, GatePriority, write_gate
 from app.core.exceptions import AppException
 from app.core.logging_setup import setup_logging
 from app.core.time_utils import format_utc8, now_utc8
@@ -27,8 +28,9 @@ from app.models.base import Base
 from app.models.models import Agent, Conversation, ConversationParticipant, Message, Recommendation, User
 from app.schemas.common import ErrorDetail
 from app.schemas.schemas import UserRegister
-from app.services import auth_service, avatar_service, chat_service, discovery_service, simulator_service
+from app.services import auth_service, chat_service, discovery_service, simulator_service
 from app.services.agent_tools import TOOL_SCHEMAS, build_tool_dispatch
+from app.services.avatar_queue import AvatarQueue
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = BASE_DIR / "templates"
@@ -53,52 +55,21 @@ def svg_data_uri(svg: str | None) -> str:
 
 
 async def _run_avatar_backfill_loop(app: FastAPI) -> None:
-    session_factory = app.state.session_factory
-    settings = app.state.settings
-    llm = app.state.llm
-    interval = max(10, settings.AVATAR_BACKFILL_INTERVAL_SECONDS)
-
-    while True:
-        try:
-            async with session_factory() as session:
-                generated = await avatar_service.backfill_agent_avatars(
-                    session=session,
-                    llm=llm,
-                    settings=settings,
-                )
-                await session.commit()
-                if generated:
-                    logger.info("avatar_backfill_generated", count=generated)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("avatar_backfill_failed", error=str(exc), exc_info=True)
-
-        await asyncio.sleep(interval)
+    """头像 backfill：只负责把缺头像的 agent 投进队列，生成由 AvatarQueue 串行处理。"""
+    avatar_queue: AvatarQueue = app.state.avatar_queue
+    try:
+        await avatar_queue.run_backfill_loop()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("avatar_backfill_loop_crashed", error=str(exc), exc_info=True)
 
 
-def _trigger_avatar_generation_for_agent(app: FastAPI, agent_id: int) -> None:
-    async def _task() -> None:
-        session_factory = app.state.session_factory
-        async with session_factory() as session:
-            try:
-                await avatar_service.trigger_single_agent_avatar(
-                    session=session,
-                    agent_id=agent_id,
-                    llm=app.state.llm,
-                    settings=app.state.settings,
-                )
-                await session.commit()
-            except Exception as exc:
-                await session.rollback()
-                logger.warning(
-                    "avatar_generate_single_failed",
-                    agent_id=agent_id,
-                    error=str(exc),
-                    exc_info=True,
-                )
-
-    asyncio.create_task(_task())
+def _busy_response(wants_json: bool, fallback_url: str = "/dashboard") -> Response:
+    """写门闸超时时的降级响应：宁可让用户稍后重试，也不把请求堆死在数据库上。"""
+    if wants_json:
+        return JSONResponse(status_code=503, content={"ok": False, "message": "系统繁忙，请稍后再试"})
+    return RedirectResponse(url=fallback_url, status_code=303)
 
 
 def _render_home(
@@ -496,7 +467,13 @@ async def _run_discovery_background(app: FastAPI, agent_id: int) -> None:
                     app.state.llm,
                     app.state.settings,
                 )
-                await session.commit()
+                # 探索写入走门闸 DISCOVERY 优先级，让位给用户对话
+                async with write_gate(
+                    GatePriority.DISCOVERY,
+                    timeout=app.state.settings.DB_GATE_DEFAULT_TIMEOUT_SECONDS,
+                    label="discovery_commit",
+                ):
+                    await session.commit()
             except Exception as exc:
                 await session.rollback()
                 logger.error("discovery_background_failed", agent_id=agent_id, error=str(exc), exc_info=True)
@@ -528,7 +505,11 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_apply_startup_schema_patches)
 
+    avatar_queue: AvatarQueue | None = None
     if settings.AVATAR_GENERATION_ENABLED:
+        avatar_queue = AvatarQueue(app.state.session_factory, app.state.llm, settings)
+        app.state.avatar_queue = avatar_queue
+        avatar_queue.start(workers=settings.AVATAR_QUEUE_CONCURRENCY)
         _AVATAR_BACKFILL_TASK = asyncio.create_task(_run_avatar_backfill_loop(app))
 
     logger.info("app_startup", name=settings.APP_NAME, version=settings.APP_VERSION)
@@ -540,6 +521,8 @@ async def lifespan(app: FastAPI):
     if _AVATAR_BACKFILL_TASK is not None and not _AVATAR_BACKFILL_TASK.done():
         _AVATAR_BACKFILL_TASK.cancel()
     _AVATAR_BACKFILL_TASK = None
+    if avatar_queue is not None:
+        await avatar_queue.stop()
     await engine.dispose()
     logger.info("app_shutdown")
 
@@ -768,29 +751,54 @@ def create_app() -> FastAPI:
 
         session_factory = request.app.state.session_factory
         settings = request.app.state.settings
-        async with session_factory() as session:
-            try:
-                await auth_service.send_registration_code(session, clean_email, settings)
-                await session.commit()
-            except ValueError as exc:
-                await session.rollback()
-                return _render_register(
-                    templates,
-                    request,
-                    error=str(exc),
-                    prefill=prefill,
-                    email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
-                )
-            except Exception as exc:
-                await session.rollback()
-                logger.error("send_register_code_failed", error=str(exc), exc_info=True)
-                return _render_register(
-                    templates,
-                    request,
-                    error="验证码发送失败，请检查邮箱服务配置",
-                    prefill=prefill,
-                    email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
-                )
+        try:
+            async with write_gate(
+                GatePriority.INTERACT,
+                timeout=settings.DB_GATE_DEFAULT_TIMEOUT_SECONDS,
+                label="send_code",
+            ):
+                async with session_factory() as session:
+                    code = await auth_service.create_registration_code(session, clean_email, settings)
+                    await session.commit()
+        except GateAcquireTimeout:
+            logger.warning("send_register_code_busy", email=clean_email)
+            return _render_register(
+                templates,
+                request,
+                error="系统繁忙，请稍后再试",
+                prefill=prefill,
+                email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+            )
+        except ValueError as exc:
+            return _render_register(
+                templates,
+                request,
+                error=str(exc),
+                prefill=prefill,
+                email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+            )
+        except Exception as exc:
+            logger.error("send_register_code_failed", error=str(exc), exc_info=True)
+            return _render_register(
+                templates,
+                request,
+                error="验证码发送失败，请检查邮箱服务配置",
+                prefill=prefill,
+                email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+            )
+
+        # SMTP 可能阻塞十几秒，必须在数据库会话之外发送
+        try:
+            await asyncio.to_thread(auth_service.send_code_email, settings, clean_email, code)
+        except Exception as exc:
+            logger.error("send_code_email_failed", error=str(exc), exc_info=True)
+            return _render_register(
+                templates,
+                request,
+                error="验证码发送失败，请检查邮箱服务配置",
+                prefill=prefill,
+                email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+            )
 
         return _render_register(
             templates,
@@ -848,43 +856,61 @@ def create_app() -> FastAPI:
         session_factory = request.app.state.session_factory
         settings = request.app.state.settings
         created_agent_id: int | None = None
-        async with session_factory() as session:
-            try:
-                user, agent = await auth_service.register(
-                    session,
-                    UserRegister(
-                        username=clean_username,
-                        email=clean_email,
-                        password=clean_password,
-                        verification_code=clean_verification_code,
-                        agent_name=clean_agent_name,
-                    ),
-                    settings,
-                )
-                await session.commit()
-                request.session["user_id"] = user.id
-                created_agent_id = agent.id
-            except ValueError as exc:
-                await session.rollback()
-                return _render_register(
-                    templates,
-                    request,
-                    error=str(exc),
-                    prefill=prefill,
-                    email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
-                )
-            except Exception as exc:
-                await session.rollback()
-                logger.error("register_failed", error=str(exc), exc_info=True)
-                return _render_register(
-                    templates,
-                    request,
-                    error="注册失败，请稍后重试",
-                    prefill=prefill,
-                    email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
-                )
+        try:
+            async with write_gate(
+                GatePriority.INTERACT,
+                timeout=settings.DB_GATE_DEFAULT_TIMEOUT_SECONDS,
+                label="register",
+            ):
+                async with session_factory() as session:
+                    try:
+                        user, agent = await auth_service.register(
+                            session,
+                            UserRegister(
+                                username=clean_username,
+                                email=clean_email,
+                                password=clean_password,
+                                verification_code=clean_verification_code,
+                                agent_name=clean_agent_name,
+                            ),
+                            settings,
+                        )
+                        await session.commit()
+                        request.session["user_id"] = user.id
+                        created_agent_id = agent.id
+                    except ValueError as exc:
+                        await session.rollback()
+                        return _render_register(
+                            templates,
+                            request,
+                            error=str(exc),
+                            prefill=prefill,
+                            email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+                        )
+                    except Exception as exc:
+                        await session.rollback()
+                        logger.error("register_failed", error=str(exc), exc_info=True)
+                        return _render_register(
+                            templates,
+                            request,
+                            error="注册失败，请稍后重试",
+                            prefill=prefill,
+                            email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+                        )
+        except GateAcquireTimeout:
+            logger.warning("register_busy", username=clean_username)
+            return _render_register(
+                templates,
+                request,
+                error="系统繁忙，请稍后再试",
+                prefill=prefill,
+                email_cooldown_seconds=settings.EMAIL_CODE_RESEND_COOLDOWN_SECONDS,
+            )
         if created_agent_id is not None:
-            _trigger_avatar_generation_for_agent(request.app, created_agent_id)
+            # 头像生成走消息队列：不再为每个新用户直接起抱库任务
+            avatar_queue: AvatarQueue | None = getattr(request.app.state, "avatar_queue", None)
+            if avatar_queue is not None:
+                avatar_queue.enqueue(created_agent_id)
         return RedirectResponse(url="/dashboard", status_code=303)
 
     @app.get("/logout")
@@ -1254,14 +1280,23 @@ def create_app() -> FastAPI:
             return RedirectResponse(url="/", status_code=303)
 
         session_factory = request.app.state.session_factory
-        async with session_factory() as session:
-            agent = await auth_service.get_agent(session, agent_id)
-            if agent is None or agent.user_id != user_id:
-                raise HTTPException(status_code=404, detail="Agent不存在")
+        try:
+            async with write_gate(
+                GatePriority.CHAT,
+                timeout=request.app.state.settings.DB_GATE_CHAT_TIMEOUT_SECONDS,
+                label="chat_page",
+            ):
+                async with session_factory() as session:
+                    agent = await auth_service.get_agent(session, agent_id)
+                    if agent is None or agent.user_id != user_id:
+                        raise HTTPException(status_code=404, detail="Agent不存在")
 
-            conv = await chat_service.get_or_create_user_agent_conv(session, user_id)
-            messages = await chat_service.get_messages(session, conv.id)
-            await session.commit()
+                    conv = await chat_service.get_or_create_user_agent_conv(session, user_id)
+                    messages = await chat_service.get_messages(session, conv.id)
+                    await session.commit()
+        except GateAcquireTimeout:
+            logger.warning("chat_page_busy", user_id=user_id, agent_id=agent_id)
+            return _busy_response(wants_json=False, fallback_url="/dashboard")
 
         return templates.TemplateResponse(
             request=request,
@@ -1299,100 +1334,122 @@ def create_app() -> FastAPI:
             return RedirectResponse(url=f"/chat/{agent_id}", status_code=303)
 
         session_factory = request.app.state.session_factory
-        async with session_factory() as session:
-            agent_resp = await auth_service.get_agent(session, agent_id)
-            if agent_resp is None or agent_resp.user_id != user_id:
-                raise HTTPException(status_code=404, detail="Agent不存在")
+        settings = request.app.state.settings
+        chat_gate_timeout = settings.DB_GATE_CHAT_TIMEOUT_SECONDS
 
-            conv = await chat_service.get_or_create_user_agent_conv(session, user_id)
-            user_msg = await chat_service.send_message(session, conv.id, "user", user_id, clean_content)
+        # —— 事务 1（对话最高优先级）：落库用户消息后立即提交，事务里绝不等待 LLM ——
+        try:
+            async with write_gate(GatePriority.CHAT, timeout=chat_gate_timeout, label="chat_send"):
+                async with session_factory() as session:
+                    agent_resp = await auth_service.get_agent(session, agent_id)
+                    if agent_resp is None or agent_resp.user_id != user_id:
+                        raise HTTPException(status_code=404, detail="Agent不存在")
 
-            messages = await chat_service.get_messages(session, conv.id)
-            recent_messages = messages[-30:]
-            llm_messages = [
-                {"role": "assistant" if m.sender_role == "agent" else "user", "content": m.content}
-                for m in recent_messages
-            ]
+                    conv = await chat_service.get_or_create_user_agent_conv(session, user_id)
+                    user_msg = await chat_service.send_message(session, conv.id, "user", user_id, clean_content)
+                    messages = await chat_service.get_messages(session, conv.id)
+                    await session.commit()
+        except GateAcquireTimeout:
+            logger.warning("chat_send_busy", user_id=user_id, agent_id=agent_id)
+            return _busy_response(wants_json, fallback_url=f"/chat/{agent_id}")
 
-            llm = request.app.state.llm
-            system_prompt = {
-                "role": "system",
-                "content": _build_chat_system_prompt(agent_resp.name, agent_resp.personality or {}),
-            }
-            fallback_reply = "我收到了你的消息，但模型服务暂时不可用。你可以继续说，我会尽快恢复。"
+        recent_messages = messages[-30:]
+        llm_messages = [
+            {"role": "assistant" if m.sender_role == "agent" else "user", "content": m.content}
+            for m in recent_messages
+        ]
 
-            tool_traces: list[dict[str, Any]] = []
-            if llm is None:
-                agent_reply = fallback_reply
-            else:
-                try:
-                    # Tool Use：让 Agent 能主动调用 search_similar_users / chat_with_agent 等工具
-                    tool_dispatch = build_tool_dispatch(
-                        session=session,
-                        current_user_id=user_id,
-                        llm=llm,
-                        settings=app.state.settings,
-                    )
-                    agent_reply, tool_traces = await llm.chat_with_tools_traced(
-                        [system_prompt] + llm_messages,
-                        tools=TOOL_SCHEMAS,
-                        tool_dispatch=tool_dispatch,
-                        max_rounds=3,
-                        temperature=0.25,
-                        max_tokens=320,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "chat_llm_failed",
-                        user_id=user_id,
-                        agent_id=agent_id,
-                        conversation_id=conv.id,
-                        error=str(exc),
-                    )
-                    agent_reply = fallback_reply
+        llm = request.app.state.llm
+        system_prompt = {
+            "role": "system",
+            "content": _build_chat_system_prompt(agent_resp.name, agent_resp.personality or {}),
+        }
+        fallback_reply = "我收到了你的消息，但模型服务暂时不可用。你可以继续说，我会尽快恢复。"
 
-            agent_msg = await chat_service.send_message(session, conv.id, "agent", agent_resp.id, agent_reply)
-            if tool_traces:
-                logger.info(
-                    "chat_tool_used",
+        # LLM 推理与工具调用期间不持有任何数据库事务；每个工具自开短会话
+        tool_traces: list[dict[str, Any]] = []
+        if llm is None:
+            agent_reply = fallback_reply
+        else:
+            try:
+                # Tool Use：让 Agent 能主动调用 search_similar_users / chat_with_agent 等工具
+                tool_dispatch = build_tool_dispatch(
+                    session=None,
+                    current_user_id=user_id,
+                    llm=llm,
+                    settings=settings,
+                    session_factory=session_factory,
+                )
+                agent_reply, tool_traces = await llm.chat_with_tools_traced(
+                    [system_prompt] + llm_messages,
+                    tools=TOOL_SCHEMAS,
+                    tool_dispatch=tool_dispatch,
+                    max_rounds=3,
+                    temperature=0.25,
+                    max_tokens=320,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "chat_llm_failed",
                     user_id=user_id,
                     agent_id=agent_id,
                     conversation_id=conv.id,
-                    tools=[t.get("name") for t in tool_traces],
+                    error=str(exc),
+                )
+                agent_reply = fallback_reply
+
+        # 画像提取是纯 LLM 调用，同样放在事务外
+        user_turns = sum(1 for m in recent_messages if m.sender_role == "user")
+        extracted: dict[str, Any] = {}
+        if llm is not None and user_turns > 0 and user_turns % 3 == 0:
+            try:
+                # 把已有画像喂给提取器，让它在源头就避免输出已有概念的同义词/变体
+                current_profile = agent_resp.personality or {}
+                extracted_profile = await llm.extract_personality(
+                    llm_messages, existing=current_profile
+                )
+                extracted_context = await llm.extract_user_context(
+                    llm_messages, existing=current_profile
+                )
+                if isinstance(extracted_profile, dict):
+                    extracted.update(extracted_profile)
+                if isinstance(extracted_context, dict):
+                    extracted.update(extracted_context)
+            except Exception as exc:
+                logger.warning(
+                    "profile_extract_failed",
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    conversation_id=conv.id,
+                    error=str(exc),
                 )
 
-            # 每 3 条用户消息增量整理一次画像和上下文记忆。
-            user_turns = sum(1 for m in recent_messages if m.sender_role == "user")
-            if llm is not None and user_turns > 0 and user_turns % 3 == 0:
-                try:
-                    # 把已有画像喂给提取器，让它在源头就避免输出已有概念的同义词/变体
-                    current_profile = agent_resp.personality or {}
-                    extracted_profile = await llm.extract_personality(
-                        llm_messages, existing=current_profile
-                    )
-                    extracted_context = await llm.extract_user_context(
-                        llm_messages, existing=current_profile
-                    )
-                    extracted: dict[str, Any] = {}
-                    if isinstance(extracted_profile, dict):
-                        extracted.update(extracted_profile)
-                    if isinstance(extracted_context, dict):
-                        extracted.update(extracted_context)
-                    agent_model = (
-                        await session.execute(select(Agent).where(Agent.id == agent_resp.id))
-                    ).scalar_one_or_none()
-                    if agent_model:
-                        agent_model.personality = _merge_profile(agent_model.personality, extracted)
-                except Exception as exc:
-                    logger.warning(
-                        "profile_extract_failed",
-                        user_id=user_id,
-                        agent_id=agent_id,
-                        conversation_id=conv.id,
-                        error=str(exc),
-                    )
+        # —— 事务 2（对话最高优先级）：写回 Agent 回复与画像整理，用完即释放 ——
+        try:
+            async with write_gate(GatePriority.CHAT, timeout=chat_gate_timeout, label="chat_reply"):
+                async with session_factory() as session:
+                    agent_msg = await chat_service.send_message(session, conv.id, "agent", agent_resp.id, agent_reply)
+                    if tool_traces:
+                        logger.info(
+                            "chat_tool_used",
+                            user_id=user_id,
+                            agent_id=agent_id,
+                            conversation_id=conv.id,
+                            tools=[t.get("name") for t in tool_traces],
+                        )
+                    if extracted:
+                        agent_model = (
+                            await session.execute(select(Agent).where(Agent.id == agent_resp.id))
+                        ).scalar_one_or_none()
+                        if agent_model:
+                            agent_model.personality = _merge_profile(agent_model.personality, extracted)
+                    await session.commit()
+        except GateAcquireTimeout:
+            logger.warning(
+                "chat_reply_busy", user_id=user_id, agent_id=agent_id, conversation_id=conv.id
+            )
+            return _busy_response(wants_json, fallback_url=f"/chat/{agent_id}")
 
-            await session.commit()
         if wants_json:
             return JSONResponse(
                 status_code=200,
@@ -1427,16 +1484,25 @@ def create_app() -> FastAPI:
             return RedirectResponse(url="/", status_code=303)
 
         session_factory = request.app.state.session_factory
-        async with session_factory() as session:
-            agent_resp = await auth_service.get_agent(session, agent_id)
-            if agent_resp is None or agent_resp.user_id != user_id:
-                raise HTTPException(status_code=404, detail="Agent不存在")
+        try:
+            async with write_gate(
+                GatePriority.CHAT,
+                timeout=request.app.state.settings.DB_GATE_CHAT_TIMEOUT_SECONDS,
+                label="chat_clear",
+            ):
+                async with session_factory() as session:
+                    agent_resp = await auth_service.get_agent(session, agent_id)
+                    if agent_resp is None or agent_resp.user_id != user_id:
+                        raise HTTPException(status_code=404, detail="Agent不存在")
 
-            conv = await chat_service.get_or_create_user_agent_conv(session, user_id)
-            deleted = await session.execute(
-                Message.__table__.delete().where(Message.conversation_id == conv.id)
-            )
-            await session.commit()
+                    conv = await chat_service.get_or_create_user_agent_conv(session, user_id)
+                    deleted = await session.execute(
+                        Message.__table__.delete().where(Message.conversation_id == conv.id)
+                    )
+                    await session.commit()
+        except GateAcquireTimeout:
+            logger.warning("chat_clear_busy", user_id=user_id, agent_id=agent_id)
+            return _busy_response(wants_json, fallback_url=f"/chat/{agent_id}")
 
         if wants_json:
             return JSONResponse(
@@ -1604,30 +1670,39 @@ def create_app() -> FastAPI:
             return RedirectResponse(url=f"/dm/{conversation_id}", status_code=303)
 
         session_factory = request.app.state.session_factory
-        async with session_factory() as session:
-            conv = (
-                await session.execute(
-                    select(Conversation).where(
-                        (Conversation.id == conversation_id)
-                        & (Conversation.conv_type == "user_user")
+        try:
+            async with write_gate(
+                GatePriority.CHAT,
+                timeout=request.app.state.settings.DB_GATE_CHAT_TIMEOUT_SECONDS,
+                label="dm_send",
+            ):
+                async with session_factory() as session:
+                    conv = (
+                        await session.execute(
+                            select(Conversation).where(
+                                (Conversation.id == conversation_id)
+                                & (Conversation.conv_type == "user_user")
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if conv is None:
+                        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+                    membership = await session.execute(
+                        select(ConversationParticipant).where(
+                            (ConversationParticipant.conversation_id == conversation_id)
+                            & (ConversationParticipant.entity_type == "user")
+                            & (ConversationParticipant.entity_id == user_id)
+                        )
                     )
-                )
-            ).scalar_one_or_none()
-            if conv is None:
-                raise HTTPException(status_code=404, detail="Conversation not found.")
+                    if membership.scalar_one_or_none() is None:
+                        raise HTTPException(status_code=403, detail="无权限")
 
-            membership = await session.execute(
-                select(ConversationParticipant).where(
-                    (ConversationParticipant.conversation_id == conversation_id)
-                    & (ConversationParticipant.entity_type == "user")
-                    & (ConversationParticipant.entity_id == user_id)
-                )
-            )
-            if membership.scalar_one_or_none() is None:
-                raise HTTPException(status_code=403, detail="无权限")
-
-            await chat_service.send_message(session, conversation_id, "user", user_id, clean_content)
-            await session.commit()
+                    await chat_service.send_message(session, conversation_id, "user", user_id, clean_content)
+                    await session.commit()
+        except GateAcquireTimeout:
+            logger.warning("dm_send_busy", user_id=user_id, conversation_id=conversation_id)
+            return _busy_response(wants_json=False, fallback_url=f"/dm/{conversation_id}")
         return RedirectResponse(url=f"/dm/{conversation_id}", status_code=303)
 
     @app.post("/discover/{agent_id}")
@@ -1637,24 +1712,33 @@ def create_app() -> FastAPI:
             return RedirectResponse(url="/", status_code=303)
 
         session_factory = request.app.state.session_factory
-        async with session_factory() as session:
-            agent = (
-                await session.execute(
-                    select(Agent).where((Agent.id == agent_id) & (Agent.user_id == user_id))
-                )
-            ).scalar_one_or_none()
-            if agent is None:
-                raise HTTPException(status_code=403, detail="无权限")
+        try:
+            async with write_gate(
+                GatePriority.INTERACT,
+                timeout=request.app.state.settings.DB_GATE_DEFAULT_TIMEOUT_SECONDS,
+                label="discover_web",
+            ):
+                async with session_factory() as session:
+                    agent = (
+                        await session.execute(
+                            select(Agent).where((Agent.id == agent_id) & (Agent.user_id == user_id))
+                        )
+                    ).scalar_one_or_none()
+                    if agent is None:
+                        raise HTTPException(status_code=403, detail="无权限")
 
-            active_task = _DISCOVERY_TASKS.get(agent_id)
-            if active_task is not None and not active_task.done():
-                return RedirectResponse(url="/dashboard", status_code=303)
+                    active_task = _DISCOVERY_TASKS.get(agent_id)
+                    if active_task is not None and not active_task.done():
+                        return RedirectResponse(url="/dashboard", status_code=303)
 
-            if agent.status != "discovering":
-                agent.status = "discovering"
-                await session.commit()
-            else:
-                await session.rollback()
+                    if agent.status != "discovering":
+                        agent.status = "discovering"
+                        await session.commit()
+                    else:
+                        await session.rollback()
+        except GateAcquireTimeout:
+            logger.warning("discover_web_busy", user_id=user_id, agent_id=agent_id)
+            return _busy_response(wants_json=False, fallback_url="/dashboard")
 
         _DISCOVERY_TASKS[agent_id] = asyncio.create_task(
             _run_discovery_background(request.app, agent_id)
@@ -1692,55 +1776,64 @@ async def _handle_approval(request: Request, rec_id: int, approve: bool):
         return RedirectResponse(url="/", status_code=303)
 
     session_factory = request.app.state.session_factory
-    async with session_factory() as session:
-        rec = (
-            await session.execute(select(Recommendation).where(Recommendation.id == rec_id))
-        ).scalar_one_or_none()
-        if rec is None:
-            raise HTTPException(status_code=404, detail="推荐不存在")
+    try:
+        async with write_gate(
+            GatePriority.INTERACT,
+            timeout=request.app.state.settings.DB_GATE_DEFAULT_TIMEOUT_SECONDS,
+            label="approval",
+        ):
+            async with session_factory() as session:
+                rec = (
+                    await session.execute(select(Recommendation).where(Recommendation.id == rec_id))
+                ).scalar_one_or_none()
+                if rec is None:
+                    raise HTTPException(status_code=404, detail="推荐不存在")
 
-        agent = (await session.execute(select(Agent).where(Agent.user_id == user_id))).scalar_one_or_none()
-        if agent is None:
-            raise HTTPException(status_code=403, detail="无权限")
+                agent = (await session.execute(select(Agent).where(Agent.user_id == user_id))).scalar_one_or_none()
+                if agent is None:
+                    raise HTTPException(status_code=403, detail="无权限")
 
-        if approve:
-            if agent.id == rec.from_agent_id:
-                rec.from_approved = True
-            elif agent.id == rec.to_agent_id:
-                rec.to_approved = True
-            else:
-                raise HTTPException(status_code=403, detail="无权限")
+                if approve:
+                    if agent.id == rec.from_agent_id:
+                        rec.from_approved = True
+                    elif agent.id == rec.to_agent_id:
+                        rec.to_approved = True
+                    else:
+                        raise HTTPException(status_code=403, detail="无权限")
 
-            if rec.from_approved and rec.to_approved:
-                rec.status = "mutual"
-                from_agent = (
-                    await session.execute(select(Agent).where(Agent.id == rec.from_agent_id))
-                ).scalar_one()
-                to_agent = (
-                    await session.execute(select(Agent).where(Agent.id == rec.to_agent_id))
-                ).scalar_one()
+                    if rec.from_approved and rec.to_approved:
+                        rec.status = "mutual"
+                        from_agent = (
+                            await session.execute(select(Agent).where(Agent.id == rec.from_agent_id))
+                        ).scalar_one()
+                        to_agent = (
+                            await session.execute(select(Agent).where(Agent.id == rec.to_agent_id))
+                        ).scalar_one()
 
-                dm = Conversation(conv_type="user_user")
-                session.add(dm)
-                await session.flush()
-                session.add(
-                    ConversationParticipant(
-                        conversation_id=dm.id,
-                        entity_type="user",
-                        entity_id=from_agent.user_id,
-                    )
-                )
-                session.add(
-                    ConversationParticipant(
-                        conversation_id=dm.id,
-                        entity_type="user",
-                        entity_id=to_agent.user_id,
-                    )
-                )
-        else:
-            rec.status = "rejected"
+                        dm = Conversation(conv_type="user_user")
+                        session.add(dm)
+                        await session.flush()
+                        session.add(
+                            ConversationParticipant(
+                                conversation_id=dm.id,
+                                entity_type="user",
+                                entity_id=from_agent.user_id,
+                            )
+                        )
+                        session.add(
+                            ConversationParticipant(
+                                conversation_id=dm.id,
+                                entity_type="user",
+                                entity_id=to_agent.user_id,
+                            )
+                        )
+                else:
+                    rec.status = "rejected"
 
-        await session.commit()
+                await session.commit()
+    except GateAcquireTimeout:
+        logger.warning("approval_busy", user_id=user_id, rec_id=rec_id)
+        return _busy_response(wants_json=False, fallback_url="/dashboard")
     return RedirectResponse(url="/dashboard", status_code=303)
 
 

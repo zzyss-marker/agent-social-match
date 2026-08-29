@@ -80,12 +80,19 @@ class Settings(BaseSettings):
     LLM_MAX_TOKENS: int = 1024
     LLM_TEMPERATURE: float = 0.7
 
-    # Agent avatar generation
+    # Agent avatar generation（走 AvatarQueue 消息队列，worker 串行处理）
     AVATAR_GENERATION_ENABLED: bool = True
     AVATAR_BACKFILL_INTERVAL_SECONDS: int = 30
     AVATAR_BATCH_SIZE: int = 4
     AVATAR_MAX_RETRIES: int = 8
     AVATAR_RETRY_BASE_SECONDS: int = 30
+    AVATAR_QUEUE_CONCURRENCY: int = 1
+    AVATAR_QUEUE_MAX_SIZE: int = 200
+    AVATAR_LLM_TIMEOUT_SECONDS: int = 60
+
+    # SQLite 写门闸：等锁超时后放弃而不是把请求堆死
+    DB_GATE_CHAT_TIMEOUT_SECONDS: float = 15.0
+    DB_GATE_DEFAULT_TIMEOUT_SECONDS: float = 10.0
 
 
 def resolve_data_dir(database_url: str) -> Path:
